@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -73,12 +74,56 @@ void test_throughput() {
     fs::remove_all(kDir, ec);
 }
 
+// Threads printing to one unbuffered FILE at once. musl never locks its FILEs on the PS4 and points an
+// unbuffered one at a buffer on the printing thread's stack, so without the kit's stdio lock
+// (ps4_stdio.cpp) the lines come out garbled or the threads write each other's stacks.
+void test_stdio_threads() {
+    std::error_code ec;
+    fs::create_directories(kDir, ec);
+    std::string path = std::string(kDir) + "/stdio.txt";
+    FILE* f = fopen(path.c_str(), "w");
+    if (!f) { check(false, "stdio-threads", "fopen failed"); return; }
+    setvbuf(f, nullptr, _IONBF, 0);
+    constexpr int kThreads = 6, kLines = 2000;
+    static const char kPayload[] = "the quick brown fox jumps over the lazy dog";
+    uint64_t t0 = now_us();
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; t++)
+        threads.emplace_back([f, t] {
+            char text[128];
+            for (int i = 0; i < kLines; i++) {  // one call per line: fprintf, fputs, fwrite
+                if (i % 3 == 0) { fprintf(f, "t%d %05d %s\n", t, i, kPayload); continue; }
+                int n = snprintf(text, sizeof text, "t%d %05d %s\n", t, i, kPayload);
+                if (i % 3 == 1) fputs(text, f);
+                else fwrite(text, 1, n, f);
+            }
+        });
+    for (auto& th : threads) th.join();
+    fclose(f);
+    double ms = double(now_us() - t0) / 1e3;
+    int good = 0, bad = 0;
+    f = fopen(path.c_str(), "r");
+    char line[256], want[256];
+    while (f && fgets(line, sizeof line, f)) {
+        int t = -1, i = -1;
+        if (sscanf(line, "t%d %d", &t, &i) == 2)
+            snprintf(want, sizeof want, "t%d %05d %s\n", t, i, kPayload);
+        if (t >= 0 && i >= 0 && strcmp(line, want) == 0) good++;
+        else bad++;
+    }
+    if (f) fclose(f);
+    check(good == kThreads * kLines && bad == 0, "stdio-threads", "%d threads: %d of %d lines intact, %d garbled, %.0f ms",
+          kThreads, good, kThreads * kLines, bad, ms);
+    fs::remove_all(kDir, ec);
+}
+
 }  // namespace
 
 void run_io_tests() {
     report("== Files");
     test_filesystem();
     test_throughput();
+    test_stdio_threads();
 }
 
 }  // namespace kittest

@@ -29,6 +29,7 @@ set(PS4_KIT_RUNTIME_SOURCES
     ${PS4_KIT_DIR}/runtime/ps4_random.c
     ${PS4_KIT_DIR}/runtime/ps4_net.cpp
     ${PS4_KIT_DIR}/runtime/ps4_fileat.cpp
+    ${PS4_KIT_DIR}/runtime/ps4_stdio.cpp
     ${PS4_KIT_DIR}/runtime/ps4_bsd.c)
 if (PS4_KIT_NETFS)
     list(APPEND PS4_KIT_RUNTIME_SOURCES ${PS4_KIT_DIR}/runtime/ps4_netfs.cpp)
@@ -118,6 +119,10 @@ set(PS4_KIT_APP_WRAPS exit munmap mprotect sceKernelMunmap sceKernelMprotect sce
 if (PS4_KIT_NETFS)
     list(APPEND PS4_KIT_APP_WRAPS read _read readv _readv pread lseek fstat getdents)
 endif ()
+#  stdio output (ps4_stdio.cpp): one lock around it, as musl never locks its FILEs here (two threads
+#    printing at once wrote each other's stacks). Each is also --undefined: the libc function gets
+#    linked even when nothing in the app calls it, or its __real_ name is left as an import.
+set(PS4_KIT_STDIO_WRAPS vfprintf vprintf fprintf printf fputs puts fputc putc putchar fwrite fflush perror)
 
 # --- Identity ----------------------------------------------------------------------------------
 # The plain homebrew identity: Vulkan (RADV on GNM) gets the 4.5 GiB of direct memory under it. Ports
@@ -185,6 +190,9 @@ function(ps4_kit_app target)
     target_link_libraries(${target} PRIVATE ps4kit_runtime)
     foreach (fn ${PS4_KIT_APP_WRAPS})
         target_link_options(${target} PRIVATE --wrap=${fn})
+    endforeach ()
+    foreach (fn ${PS4_KIT_STDIO_WRAPS})
+        target_link_options(${target} PRIVATE --wrap=${fn} --undefined=${fn})
     endforeach ()
     # The PS4 resolver and module loader (ps4_net.cpp, ps4_modules.cpp); netfs's protocol libraries
     # from the sysroot.
