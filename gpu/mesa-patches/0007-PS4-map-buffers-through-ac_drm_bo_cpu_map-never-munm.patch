@@ -1,0 +1,57 @@
+From 30be9db3b1b8d95144f207a71e0ad9d6d36b9746 Mon Sep 17 00:00:00 2001
+From: ShiroKlein <23220202+iHaiDeeZ@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 17:55:00 +0300
+Subject: [PATCH 07/28] PS4: map buffers through ac_drm_bo_cpu_map, never
+ munmap
+
+---
+ src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+index fb84e4b..b8c79c9 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+@@ -474,8 +474,10 @@ radv_amdgpu_winsys_bo_destroy(struct radeon_winsys *_ws, struct radeon_winsys_bo
+       return;
+    }
+ 
++#ifndef __PS4__ /* the CPU mapping is the GPU mapping (ac_ps4_drm.c) */
+    if (bo->cpu_map)
+       munmap(bo->cpu_map, bo->base.size);
++#endif
+ 
+    if (ws->debug_all_bos)
+       radv_amdgpu_global_bo_list_del(ws, bo);
+@@ -802,6 +804,17 @@ radv_amdgpu_winsys_bo_map(struct radeon_winsys *_ws, struct radeon_winsys_bo *_b
+    }
+ #endif
+ 
++#ifdef __PS4__
++   {
++      struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
++      void *data = NULL;
++      if (use_fixed_addr || ac_drm_bo_cpu_map(ws->dev, bo->bo, &data))
++         return NULL;
++      bo->cpu_map = data;
++      return data;
++   }
++#endif
++
+    union drm_amdgpu_gem_mmap args;
+    memset(&args, 0, sizeof(args));
+    args.in.handle = bo->bo_handle;
+@@ -829,6 +842,10 @@ radv_amdgpu_winsys_bo_unmap(struct radeon_winsys *_ws, struct radeon_winsys_bo *
+       return;
+ 
+    assert(bo->cpu_map);
++#ifdef __PS4__
++   bo->cpu_map = NULL;
++   return;
++#endif
+    if (replace) {
+       (void)mmap(bo->cpu_map, bo->base.size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    } else {
+-- 
+2.53.0
+

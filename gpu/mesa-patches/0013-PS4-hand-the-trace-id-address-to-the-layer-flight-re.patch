@@ -1,0 +1,33 @@
+From f023cb96da76de0d0fa9c839f43c693f2c98839b Mon Sep 17 00:00:00 2001
+From: ShiroKlein <23220202+iHaiDeeZ@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 23:49:57 +0300
+Subject: [PATCH 13/28] PS4: hand the trace id address to the layer flight
+ recorder
+
+---
+ src/amd/vulkan/radv_device.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+index 39ab1f5..fc63006 100644
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -670,8 +670,13 @@ radv_device_init_device_fault_detection(struct radv_device *device)
+ 
+    if (!radv_device_fault_detection_enabled(device)) {
+ #ifdef __PS4__
+-      if (os_get_option("RADV_PS4_TRACE") && !radv_init_trace(device))
+-         return VK_ERROR_INITIALIZATION_FAILED;
++      if (os_get_option("RADV_PS4_TRACE")) {
++         if (!radv_init_trace(device))
++            return VK_ERROR_INITIALIZATION_FAILED;
++         /* The PS4 layer's flight recorder follows the GPU's progress through these ids. */
++         extern void ac_ps4_set_trace_va(uint64_t va);
++         ac_ps4_set_trace_va(radv_buffer_get_va(device->trace_bo) + offsetof(struct radv_trace_data, primary_id));
++      }
+ #endif
+       return VK_SUCCESS;
+    }
+-- 
+2.53.0
+

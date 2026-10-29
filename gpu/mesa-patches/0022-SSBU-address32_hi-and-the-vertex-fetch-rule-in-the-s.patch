@@ -1,0 +1,36 @@
+From 713601e6e34378c5a27e6bcd0ab3164ee4583cd8 Mon Sep 17 00:00:00 2001
+From: ShiroKlein <ihaideezi@gmail.com>
+Date: Wed, 21 Oct 2026 08:02:12 +0300
+Subject: [PATCH 22/28] SSBU: address32_hi and the vertex fetch rule in the
+ shader cache's identity
+
+---
+ src/amd/vulkan/radv_physical_device.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 411bd7f..852e25d 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -334,6 +334,18 @@ radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
+       return -1;
+ #endif
+ 
++#if defined(__PS4__) || defined(AC_PS4_ALIGNED_VERTEX_FETCH)
++   /* PS4 (SSBU port): shader binaries embed the upper half of the 32-bit GPU address window
++    * (descriptor and vertex buffer pointers), which the PS4 layer reserves at start (so far always
++    * 0x44), and the vertex fetch rule is a run-time switch: both in the cache's identity, so a
++    * cache made under other values (or on the PC, for the PS4) is never used for the wrong ones. */
++   {
++      extern int ac_ps4_unaligned_vertex_fetch;
++      const uint32_t ps4_key[2] = {pdev->info.address32_hi, (uint32_t)ac_ps4_unaligned_vertex_fetch};
++      _mesa_sha1_update(&ctx, ps4_key, sizeof(ps4_key));
++   }
++#endif
++
+    _mesa_sha1_final(&ctx, sha1);
+ 
+    memcpy(uuid, sha1, VK_UUID_SIZE);
+-- 
+2.53.0
+

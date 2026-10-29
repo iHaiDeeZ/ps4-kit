@@ -1,0 +1,52 @@
+From d2abe4fce779270dfdb3ee7c9d4ffa33a92d8eb4 Mon Sep 17 00:00:00 2001
+From: ShiroKlein <ihaideezi@gmail.com>
+Date: Wed, 21 Oct 2026 08:08:32 +0300
+Subject: [PATCH 24/28] SSBU: the disk cache's index in memory on the PS4 (no
+ shared file mapping)
+
+---
+ src/util/disk_cache_os.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/src/util/disk_cache_os.c b/src/util/disk_cache_os.c
+index f31c8dc..6ea537a 100644
+--- a/src/util/disk_cache_os.c
++++ b/src/util/disk_cache_os.c
+@@ -1107,6 +1107,22 @@ disk_cache_mmap_cache_index(void *mem_ctx, struct disk_cache *cache)
+    int fd = -1;
+    bool mapped = false;
+ 
++#ifdef __PS4__
++   /* PS4 (SSBU port): the index (the cache's size and keys, for the multi-file cache's eviction and
++    * disk_cache_put_key) in memory of its own: a shared mapping of a file is not to be relied on
++    * here, and the single-file cache, RADV's, never reads it. */
++   {
++      const size_t size = sizeof(*cache->size) + CACHE_INDEX_MAX_KEYS * CACHE_KEY_SIZE;
++      cache->index_mmap = calloc(1, size);
++      if (!cache->index_mmap)
++         return false;
++      cache->index_mmap_size = size;
++      cache->size = (p_atomic_uint64_t *) cache->index_mmap;
++      cache->stored_keys = cache->index_mmap + sizeof(uint64_t);
++      return true;
++   }
++#endif
++
+    char *path = ralloc_asprintf(mem_ctx, "%s/index", cache->path);
+    if (path == NULL)
+       goto path_fail;
+@@ -1180,7 +1196,11 @@ path_fail:
+ void
+ disk_cache_destroy_mmap(struct disk_cache *cache)
+ {
++#ifdef __PS4__
++   free(cache->index_mmap);
++#else
+    munmap(cache->index_mmap, cache->index_mmap_size);
++#endif
+ }
+ 
+ void *
+-- 
+2.53.0
+

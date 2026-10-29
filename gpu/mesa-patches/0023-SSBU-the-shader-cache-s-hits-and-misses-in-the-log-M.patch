@@ -1,0 +1,50 @@
+From 2bfa409ad17d04d2cf6ec782c6f426b24e15df7b Mon Sep 17 00:00:00 2001
+From: ShiroKlein <ihaideezi@gmail.com>
+Date: Wed, 21 Oct 2026 08:05:45 +0300
+Subject: [PATCH 23/28] SSBU: the shader cache's hits and misses in the log;
+ Mesa's own-user check off on the PS4
+
+---
+ src/util/disk_cache.c | 12 ++++++++++++
+ src/util/u_debug.h    |  2 +-
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/src/util/disk_cache.c b/src/util/disk_cache.c
+index d86153a..b58427c 100644
+--- a/src/util/disk_cache.c
++++ b/src/util/disk_cache.c
+@@ -630,6 +630,18 @@ disk_cache_get(struct disk_cache *cache, const cache_key key, size_t *size)
+          p_atomic_inc(&cache->stats.misses);
+    }
+ 
++#ifdef __PS4__
++   /* PS4 (SSBU port): how the cache does, in the log (the process is never ended normally, so
++    * MESA_SHADER_CACHE_SHOW_STATS's line at exit never comes): the first lookups, then every 500 */
++   {
++      static uint32_t ps4_hits, ps4_misses;
++      const uint32_t h = buf ? p_atomic_inc_return(&ps4_hits) : p_atomic_read(&ps4_hits);
++      const uint32_t m = buf ? p_atomic_read(&ps4_misses) : p_atomic_inc_return(&ps4_misses);
++      if (h + m <= 8 || (h + m) % 500 == 0)
++         fprintf(stderr, "mesa: shader cache: %u found, %u not (%s)\n", h, m, cache->path ? cache->path : "?");
++   }
++#endif
++
+    return buf;
+ }
+ 
+diff --git a/src/util/u_debug.h b/src/util/u_debug.h
+index 9608e97..2cf6459 100644
+--- a/src/util/u_debug.h
++++ b/src/util/u_debug.h
+@@ -402,7 +402,7 @@ debug_get_option_ ## suffix (void) \
+ static inline bool
+ __normal_user(void)
+ {
+-#if defined(_WIN32)
++#if defined(_WIN32) || defined(__PS4__) /* (PS4: one user; its ids say nothing about setuid) */
+    return true;
+ #else
+    return geteuid() == getuid() && getegid() == getgid();
+-- 
+2.53.0
+

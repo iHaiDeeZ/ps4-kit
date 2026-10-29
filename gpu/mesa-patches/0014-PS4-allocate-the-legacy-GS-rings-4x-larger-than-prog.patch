@@ -1,0 +1,50 @@
+From 34ff87b30526b5f8b0dd0baa94120f876eb76d34 Mon Sep 17 00:00:00 2001
+From: ShiroKlein <23220202+iHaiDeeZ@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 22:00:35 +0300
+Subject: [PATCH 14/28] PS4: allocate the legacy GS rings 4x larger than
+ programmed (GS writes past the GS->VS ring)
+
+---
+ src/amd/vulkan/radv_queue.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_queue.c b/src/amd/vulkan/radv_queue.c
+index 671d481..7b22ab2 100644
+--- a/src/amd/vulkan/radv_queue.c
++++ b/src/amd/vulkan/radv_queue.c
+@@ -37,8 +37,14 @@ radv_get_queue_global_priority(const VkDeviceQueueGlobalPriorityCreateInfo *pObj
+ #ifdef __PS4__
+ void ac_ps4_trace(const char *fmt, ...);
+ #define PS4_FAIL(label) do { ac_ps4_trace("radv: %s:%d -> " #label "\n", __FILE__, __LINE__); goto label; } while (0)
++/* The legacy GS rings' memory, larger than the size programmed (VGT_*_RING_SIZE, the descriptors):
++ * on the PS4 the GS wrote at least 2 MiB into a 1.25 MiB GS->VS ring (Donkey Kong Country:
++ * Tropical Freeze, every crash at the ring's base + 0x200000) - on Linux such writes land in the
++ * next buffer or are dropped by the VM, on the PS4 a GPU page fault ends the app. */
++#define PS4_RING_ALLOC(size) MAX2((size) * 4, 4u << 20)
+ #else
+ #define PS4_FAIL(label) goto label
++#define PS4_RING_ALLOC(size) (size)
+ #endif
+ 
+ static VkResult
+@@ -911,7 +917,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
+    }
+ 
+    if (needs->esgs_ring_size > queue->ring_info.esgs_ring_size) {
+-      result = radv_bo_create(device, NULL, needs->esgs_ring_size, 4096, RADEON_DOMAIN_VRAM, ring_bo_flags,
++      result = radv_bo_create(device, NULL, PS4_RING_ALLOC(needs->esgs_ring_size), 4096, RADEON_DOMAIN_VRAM, ring_bo_flags,
+                               RADV_BO_PRIORITY_SCRATCH, 0, true, &esgs_ring_bo);
+       if (result != VK_SUCCESS)
+          PS4_FAIL(fail);
+@@ -919,7 +925,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
+    }
+ 
+    if (needs->gsvs_ring_size > queue->ring_info.gsvs_ring_size) {
+-      result = radv_bo_create(device, NULL, needs->gsvs_ring_size, 4096, RADEON_DOMAIN_VRAM, ring_bo_flags,
++      result = radv_bo_create(device, NULL, PS4_RING_ALLOC(needs->gsvs_ring_size), 4096, RADEON_DOMAIN_VRAM, ring_bo_flags,
+                               RADV_BO_PRIORITY_SCRATCH, 0, true, &gsvs_ring_bo);
+       if (result != VK_SUCCESS)
+          PS4_FAIL(fail);
+-- 
+2.53.0
+

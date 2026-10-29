@@ -1,0 +1,50 @@
+# Settings for the kit's crash and profile tools (crashlog.sh, profile.sh, profile.py,
+# klog-capture.py). Copy to kit.conf (beside the port's build files, or point KIT_CONF at it):
+# KEY=VALUE lines, shell syntax. Environment variables of the same name win over the file, and
+# command-line options win over both.
+
+# The console: 192.168.0.90 or 192.168.0.212 (each port's notes say which), GoldHEN's FTP port.
+PS4_HOST=192.168.0.90
+PS4_FTP_PORT=2121
+
+# The app's folder on the console (PS4_DIAG_DATA_DIR in the port) and its title ID (param.sfo).
+PS4_DATA_DIR=/data/Crema
+PS4_TITLE_ID=CREM00001
+
+# The app's name as its first boot-trace line says "<name> XX.YY starting": the crash is then
+# symbolized against $PS4_ELF_DIR/vXX.YY.elf, the build that ran.
+PS4_APP_NAME=Crema
+
+# Where the port's builds keep their ELFs (v<version>.elf) and where fetched logs go.
+PS4_BUILD_ROOT=$HOME/cemups4-build
+PS4_ELF_DIR=$PS4_BUILD_ROOT/oelf
+PS4_LOGS_DIR=$PS4_BUILD_ROOT/logs
+# PS4_ELF=...                  # a fixed ELF instead (crashlog.sh -e / profile.sh -e)
+
+# The app's own logs to fetch and show the end of (paths inside the data folder), and a regex of
+# lines in them worth showing first (errors).
+PS4_APP_LOGS="log.txt"
+# PS4_APP_LOG_ERRORS='·[EF] '
+
+# crash.log: the heading where the app's own crash lines (ps4_crash_guest_info) start, shown in
+# full; and a command run on the crashing thread's report (a file), e.g. a guest code decoder.
+# PS4_GUEST_SECTION='== PSP CPU at the crash'
+# PS4_CRASH_HOOK="python3 $HOME/cemups4/scripts/guest-code.py"
+
+# The boot-trace line of a game that stopped and went back to the menu: boot-trace-game.log is
+# shown too when the current trace has it.
+PS4_GAME_STOP_PATTERN='game stopped'
+
+# Screenshots folder inside the data folder ("" to skip), and whether to download them (1) or
+# only list them.
+PS4_SCREENSHOTS=screenshots
+PS4_SCREENSHOTS_DOWNLOAD=0
+
+# The GPU driver's folder inside the data folder (RADV on PS4: radv-ps4.log, gpu-fault.txt,
+# flight/ with the flight recorder's progress.log and ib-N.bin; "" to skip).
+PS4_GPU_DIR=gpu
+
+# A JIT's map of translated code ("address size name" lines, inside the data folder) for profile.py.
+# PS4_JIT_MAP=jit.map
+
+PS4_SYMBOLIZER=llvm-symbolizer-21

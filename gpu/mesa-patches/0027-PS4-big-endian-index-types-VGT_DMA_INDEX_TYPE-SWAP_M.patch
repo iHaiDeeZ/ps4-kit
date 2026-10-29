@@ -1,0 +1,45 @@
+From 6b4fc9f4cefe4629b898706e4017f9f509811917 Mon Sep 17 00:00:00 2001
+From: ps4-kit <ps4-kit@localhost>
+Date: Sun, 25 Oct 2026 01:58:28 +0300
+Subject: [PATCH 27/28] PS4: big-endian index types (VGT_DMA_INDEX_TYPE
+ SWAP_MODE): the GPU byte-swaps indices as it fetches them (from Crema)
+
+---
+ src/amd/vulkan/radv_cmd_buffer.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index f49b802..63ac834 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -7869,6 +7869,14 @@ radv_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer, uint32_t firstBinding,
+    cmd_buffer->state.dirty |= RADV_CMD_DIRTY_VERTEX_BUFFER;
+ }
+ 
++#ifdef __PS4__
++/* PS4 (Crema): big-endian indices as a Wii U game wrote them, byte-swapped by the VGT as it fetches
++ * them (VGT_DMA_INDEX_TYPE SWAP_MODE, GFX7) instead of converted by the CPU for every draw. Private
++ * index types, the same values in Crema (VulkanRendererCore.cpp kCremaIndexType*). */
++#define RADV_PS4_INDEX_TYPE_UINT16_BE ((VkIndexType)0x7fc50001)
++#define RADV_PS4_INDEX_TYPE_UINT32_BE ((VkIndexType)0x7fc50002)
++#endif
++
+ static uint32_t
+ vk_to_index_type(VkIndexType type)
+ {
+@@ -7879,6 +7887,12 @@ vk_to_index_type(VkIndexType type)
+       return V_028A7C_VGT_INDEX_16;
+    case VK_INDEX_TYPE_UINT32:
+       return V_028A7C_VGT_INDEX_32;
++#ifdef __PS4__
++   case RADV_PS4_INDEX_TYPE_UINT16_BE:
++      return V_028A7C_VGT_INDEX_16 | S_028A7C_SWAP_MODE(V_028A7C_VGT_DMA_SWAP_16_BIT);
++   case RADV_PS4_INDEX_TYPE_UINT32_BE:
++      return V_028A7C_VGT_INDEX_32 | S_028A7C_SWAP_MODE(V_028A7C_VGT_DMA_SWAP_32_BIT);
++#endif
+    default:
+       UNREACHABLE("invalid index type");
+    }
+-- 
+2.53.0
+

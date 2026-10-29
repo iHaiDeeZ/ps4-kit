@@ -1,0 +1,63 @@
+From 0e21f9934df08f40cd1db2b9e0fe225da995efe8 Mon Sep 17 00:00:00 2001
+From: ShiroKlein <23220202+iHaiDeeZ@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 21:04:22 +0300
+Subject: [PATCH 09/28] PS4: no SET_PREDICATION (CP firmware hangs on BOOL64),
+ no conditional rendering
+
+---
+ src/amd/vulkan/radv_cmd_buffer.c      | 10 ++++++++++
+ src/amd/vulkan/radv_physical_device.c |  8 ++++++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index 9aa348a..46373c4 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -14927,6 +14927,16 @@ radv_emit_set_predication_state(struct radv_cmd_buffer *cmd_buffer, bool draw_vi
+    struct radv_cmd_stream *cs = cmd_buffer->cs;
+    uint32_t op = 0;
+ 
++#ifdef __PS4__
++   /* The PS4's CP firmware hangs on SET_PREDICATION BOOL64 (Dolphin's first frame stopped at
++    * the first one). Without predication the predicated passes (fast clear eliminate, etc.)
++    * always run, which is correct; VK_EXT_conditional_rendering isn't exposed. */
++   (void)pdev;
++   (void)cs;
++   (void)op;
++   return;
++#endif
++
+    radeon_check_space(device->ws, cs->b, 4);
+ 
+    if (va) {
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 3299481..411bd7f 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -745,7 +745,11 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device
+       .EXT_buffer_device_address = true,
+       .EXT_calibrated_timestamps = radv_calibrated_timestamps_enabled(pdev),
+       .EXT_color_write_enable = true,
++#ifdef __PS4__
++      .EXT_conditional_rendering = false, /* no SET_PREDICATION (radv_cmd_buffer.c) */
++#else
+       .EXT_conditional_rendering = true,
++#endif
+       .EXT_conservative_rasterization = pdev->info.gfx_level >= GFX9,
+       .EXT_custom_border_color = true,
+       .EXT_custom_resolve = true,
+@@ -1050,7 +1054,11 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
+       .pushDescriptor = true,
+ 
+       /* VK_EXT_conditional_rendering */
++#ifdef __PS4__
++      .conditionalRendering = false,
++#else
+       .conditionalRendering = true,
++#endif
+       .inheritedConditionalRendering = false,
+ 
+       /* VK_KHR_vertex_attribute_divisor */
+-- 
+2.53.0
+

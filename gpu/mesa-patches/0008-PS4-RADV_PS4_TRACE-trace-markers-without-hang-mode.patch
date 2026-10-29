@@ -1,0 +1,366 @@
+From 1e2ea8382af1df759ec05fc3cf57a3718d55acc6 Mon Sep 17 00:00:00 2001
+From: ShiroKlein <23220202+iHaiDeeZ@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 20:56:01 +0300
+Subject: [PATCH 08/28] PS4: RADV_PS4_TRACE (trace markers without hang mode)
+
+---
+ src/amd/common/ac_ps4_drm.c      | 206 ++++++++++++++++++++++++++++++-
+ src/amd/vulkan/radv_cmd_buffer.c |   6 +-
+ src/amd/vulkan/radv_device.c     |   7 +-
+ 3 files changed, 214 insertions(+), 5 deletions(-)
+
+diff --git a/src/amd/common/ac_ps4_drm.c b/src/amd/common/ac_ps4_drm.c
+index bfcdf32..fe2d3db 100755
+--- a/src/amd/common/ac_ps4_drm.c
++++ b/src/amd/common/ac_ps4_drm.c
+@@ -14,6 +14,7 @@
+ #include "ac_linux_drm.h"
+ #include "ac_gpu_info.h"
+ #include "addrlib/src/amdgpu_asic_addr.h"
++#include "ac_debug.h"
+ #include "util/os_time.h"
+ #include "util/simple_mtx.h"
+ #include "util/u_math.h"
+@@ -83,6 +84,7 @@ struct amdgpu_bo {
+    bool cpu_owned; /* mapped by bo_cpu_map rather than a VA op */
+    uint32_t heap;
+    uint64_t flags;
++   off_t pad_phys; /* RADEON_FLAG_VM_PAD_1PAGE page, when it lies past the buffer (else -1) */
+ };
+ 
+ struct amdgpu_va {
+@@ -125,6 +127,15 @@ struct ac_drm_device {
+    volatile uint64_t *fence;
+    uint32_t *fence_ibs;
+    uint64_t last_seq; /* last submitted */
++
++   /* The last submissions' command buffers, for the GPU hang report. */
++   struct {
++      uint64_t seq;
++      unsigned num_ibs;
++      uint64_t va[8];
++      uint32_t bytes[8];
++   } recent[16];
++   bool hang_reported;
+ };
+ 
+ #define FENCE_IB_DW 16
+@@ -178,13 +189,151 @@ ps4_completed(ac_drm_device *dev)
+ }
+ 
+ /* Waits until submission `seq` has finished; returns false on timeout. */
++/* GPU addresses are CPU addresses: the IB parser can follow chained IBs directly. */
++static void
++ps4_ib_addr(void *data, uint64_t addr, struct ac_addr_info *info)
++{
++   ac_drm_device *dev = data;
++   memset(info, 0, sizeof(*info));
++   const bool in_window = (addr >= dev->va_start && addr < dev->va_start + PS4_VA_SIZE) ||
++                          (addr >= dev->va32_start && addr < dev->va32_start + PS4_VA32_SIZE);
++   if (in_window) {
++      info->cpu_addr = (void *)(uintptr_t)addr;
++      info->valid = true;
++   }
++}
++
++
++/* Execution check for the hang report: walks the PM4 stream (following IB chains) and, for
++ * every WRITE_DATA to memory and every EVENT_WRITE_EOP, tells whether the value is in memory -
++ * i.e. whether the GPU got past it. With RADV_DEBUG=hang RADV writes an increasing trace id
++ * after each draw, so the last "done" write marks where the GPU stopped. */
++static unsigned ps4_walk_lines;
++
++static void
++ps4_walk_ib(ac_drm_device *dev, FILE *f, const uint32_t *ib, unsigned num_dw, int depth)
++{
++   struct ac_addr_info info;
++   for (unsigned i = 0; i < num_dw && ps4_walk_lines < 4000;) {
++      const uint32_t h = ib[i];
++      const unsigned type = h >> 30;
++      if (type == 2) {
++         i++;
++         continue;
++      }
++      if (type != 3) {
++         fprintf(f, "%*s%p: non-type-3 header %#x, stop\n", depth * 2, "", (void *)&ib[i], h);
++         return;
++      }
++      const unsigned op = (h >> 8) & 0xff;
++      const unsigned body = ((h >> 16) & 0x3fff) + 1;
++      const uint32_t *b = &ib[i + 1];
++      if ((op == 0x3f || op == 0x33) && body >= 3) { /* INDIRECT_BUFFER(_CONST) */
++         const uint64_t va = b[0] | ((uint64_t)(b[1] & 0xffff) << 32);
++         const unsigned size = b[2] & 0xfffff;
++         const bool chain = b[2] & (1u << 20);
++         ps4_ib_addr(dev, va, &info);
++         fprintf(f, "%*s%p: INDIRECT_BUFFER %#llx, %u dwords%s%s\n", depth * 2, "", (void *)&ib[i],
++                 (unsigned long long)va, size, chain ? " (chain)" : "", info.valid ? "" : " INVALID");
++         ps4_walk_lines++;
++         if (info.valid && depth < 4)
++            ps4_walk_ib(dev, f, info.cpu_addr, size, chain ? depth : depth + 1);
++         if (chain)
++            return;
++      } else if (op == 0x37 && body >= 4) { /* WRITE_DATA */
++         const unsigned dst_sel = (b[0] >> 8) & 0xf;
++         if (dst_sel == 5 || dst_sel == 2 || dst_sel == 1) {
++            const uint64_t va = b[1] | ((uint64_t)b[2] << 32);
++            ps4_ib_addr(dev, va, &info);
++            const uint32_t now = info.valid ? *(volatile uint32_t *)info.cpu_addr : 0xdeadbeef;
++            fprintf(f, "%*s%p: WRITE_DATA %#llx <- %#x, memory %#x %s\n", depth * 2, "",
++                    (void *)&ib[i], (unsigned long long)va, b[3], now,
++                    now == b[3] ? "done" : "NOT DONE");
++            ps4_walk_lines++;
++         }
++      } else if (op == 0x47 && body >= 5) { /* EVENT_WRITE_EOP */
++         const uint64_t va = b[1] | ((uint64_t)(b[2] & 0xffff) << 32);
++         ps4_ib_addr(dev, va, &info);
++         const uint32_t now = info.valid ? *(volatile uint32_t *)info.cpu_addr : 0xdeadbeef;
++         fprintf(f, "%*s%p: EVENT_WRITE_EOP %#llx <- %#x, memory %#x %s\n", depth * 2, "",
++                 (void *)&ib[i], (unsigned long long)va, b[3], now,
++                 now == b[3] ? "done" : "NOT DONE");
++         ps4_walk_lines++;
++      } else if (op == 0x2d || op == 0x27 || op == 0x15 || op == 0x16) { /* draws, dispatch */
++         fprintf(f, "%*s%p: %s\n", depth * 2, "", (void *)&ib[i],
++                 op == 0x2d ? "DRAW_INDEX_AUTO" : op == 0x27 ? "DRAW_INDEX_2" : "DISPATCH");
++         ps4_walk_lines++;
++      }
++      i += 1 + body;
++   }
++}
++
++/* Writes the command buffers of the first submission the GPU hasn't finished, decoded by Mesa's
++ * IB parser, to /data/DolphinPS4/gpu-hang.txt (once). */
++static void
++ps4_report_hang(ac_drm_device *dev, uint64_t waited_seq)
++{
++   if (dev->hang_reported)
++      return;
++   dev->hang_reported = true;
++   const uint64_t completed = ps4_completed(dev);
++   ps4_log("radv/ps4: GPU hang? waiting for %llu, completed %llu, submitted %llu - writing "
++           "/data/DolphinPS4/gpu-hang.txt\n",
++           (unsigned long long)waited_seq, (unsigned long long)completed,
++           (unsigned long long)dev->last_seq);
++   FILE *f = fopen("/data/DolphinPS4/gpu-hang.txt", "w");
++   if (!f)
++      return;
++   fprintf(f, "waiting for %llu, GPU completed %llu, submitted %llu\n\n",
++           (unsigned long long)waited_seq, (unsigned long long)completed,
++           (unsigned long long)dev->last_seq);
++   for (unsigned r = 0; r < ARRAY_SIZE(dev->recent); r++) {
++      if (dev->recent[r].seq != completed + 1)
++         continue;
++      fprintf(f, "==== execution check (memory writes the GPU did / didn't do) ====\n");
++      for (unsigned i = 0; i < dev->recent[r].num_ibs; i++) {
++         fprintf(f, "-- IB %u\n", i);
++         ps4_walk_ib(dev, f, (const uint32_t *)(uintptr_t)dev->recent[r].va[i],
++                     dev->recent[r].bytes[i] / 4, 0);
++      }
++      fprintf(f, "\n==== decoded command buffers ====\n");
++      for (unsigned i = 0; i < dev->recent[r].num_ibs; i++) {
++         char name[64];
++         snprintf(name, sizeof(name), "submission %llu IB %u (%#llx, %u dwords)",
++                  (unsigned long long)dev->recent[r].seq, i,
++                  (unsigned long long)dev->recent[r].va[i], dev->recent[r].bytes[i] / 4);
++         struct ac_ib_parser ib = {
++            .f = f,
++            .ib = (uint32_t *)(uintptr_t)dev->recent[r].va[i],
++            .num_dw = dev->recent[r].bytes[i] / 4,
++            .gfx_level = GFX7,
++            .family = CHIP_BONAIRE,
++            .ip_type = AMD_IP_GFX,
++            .addr_callback = ps4_ib_addr,
++            .addr_callback_data = dev,
++         };
++         ac_parse_ib(&ib, name);
++      }
++   }
++   fclose(f);
++   ps4_log("radv/ps4: hang report written\n");
++}
++
+ static bool
+ ps4_wait_seq(ac_drm_device *dev, uint64_t seq, int64_t abs_timeout_ns)
+ {
+    unsigned spins = 0;
++   const int64_t start = os_time_get_nano();
++   bool reported = false;
+    while (ps4_completed(dev) < seq) {
+-      if (abs_timeout_ns != INT64_MAX && os_time_get_nano() >= abs_timeout_ns)
++      const int64_t now = os_time_get_nano();
++      if (abs_timeout_ns != INT64_MAX && now >= abs_timeout_ns)
+          return false;
++      /* A wait this long means the GPU stopped (hang) or the fence write never happened. */
++      if (!reported && now - start > 2000000000ll) {
++         ps4_report_hang(dev, seq);
++         reported = true;
++      }
+       if (++spins > 64)
+          sceKernelUsleep(50);
+    }
+@@ -350,6 +499,7 @@ ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_drm_
+    bo->size = align64(MAX2(req->alloc_size, 1), PS4_PAGE);
+    bo->heap = req->preferred_heap;
+    bo->flags = req->flags;
++   bo->pad_phys = -1;
+ 
+    /* VRAM: write-combined garlic (the GPU's fast path); GTT: CPU-cached onion, coherent. */
+    const int type = (req->preferred_heap & AMDGPU_GEM_DOMAIN_VRAM) ||
+@@ -393,6 +543,8 @@ ac_drm_bo_free(ac_drm_device *dev, ac_drm_bo bo)
+    if (b->cpu_owned)
+       sceKernelMunmap(b->cpu, b->size);
+    sceKernelReleaseDirectMemory(b->phys, b->size);
++   if (b->pad_phys >= 0)
++      sceKernelReleaseDirectMemory(b->pad_phys, PS4_PAGE);
+    simple_mtx_lock(&dev->lock);
+    dev->bos[b->handle] = NULL;
+    simple_mtx_unlock(&dev->lock);
+@@ -482,6 +634,7 @@ static int
+ ps4_va_op(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, uint64_t size, uint64_t addr,
+           uint64_t flags, uint32_t ops)
+ {
++   const uint64_t exact_size = size;
+    size = align64(size, PS4_PAGE);
+    if (flags & AMDGPU_VM_PAGE_PRT) {
+       ps4_log("radv/ps4: sparse (PRT) mapping requested - unsupported\n");
+@@ -497,6 +650,36 @@ ps4_va_op(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, uint64_t size
+          return -EINVAL;
+       }
+       void *a = (void *)(uintptr_t)addr;
++      const uint64_t cpu = (uintptr_t)b->cpu;
++      if (b->cpu && addr != cpu) {
++         /* A second mapping of the same memory: RADEON_FLAG_VM_PAD_1PAGE maps the first page
++          * again after the buffer, so that prefetches past the end hit valid memory. The PS4
++          * can't map direct memory twice (EBUSY). Inside the buffer's own (16 KiB rounded)
++          * mapping it's already backed; past it, back it with a page of its own. */
++         /* Starting inside the buffer's mapping: the pad page RADV wants (4 KiB) is covered;
++          * the length has been rounded to the 16 KiB system page by then (getpagesize). */
++         (void)exact_size;
++         if (addr >= cpu && addr < cpu + b->size)
++            return 0;
++         if (addr != cpu + b->size || size != PS4_PAGE || b->pad_phys >= 0) {
++            ps4_log("radv/ps4: unsupported alias mapping of bo %u at %#llx (+%#llx, %#llx bytes)\n",
++                    b->handle, (unsigned long long)addr, (unsigned long long)offset,
++                    (unsigned long long)size);
++            return -ENOSYS;
++         }
++         off_t pad;
++         if (sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), PS4_PAGE, PS4_PAGE,
++                                           PS4_WB_ONION, &pad))
++            return -ENOMEM;
++         if (sceKernelMapDirectMemory(&a, PS4_PAGE, PS4_PROT_CPU_RW | PS4_PROT_GPU_RW,
++                                      PS4_MAP_FIXED, pad, PS4_PAGE) ||
++             a != (void *)(uintptr_t)addr) {
++            sceKernelReleaseDirectMemory(pad, PS4_PAGE);
++            return -ENOMEM;
++         }
++         b->pad_phys = pad;
++         return 0;
++      }
+       int r = sceKernelMapDirectMemory(&a, size, PS4_PROT_CPU_RW | PS4_PROT_GPU_RW, PS4_MAP_FIXED,
+                                        b->phys + offset, PS4_PAGE);
+       if (r || a != (void *)(uintptr_t)addr) {
+@@ -655,6 +838,9 @@ ac_drm_cs_query_fence_status(ac_drm_device *dev, uint32_t ctx_id, uint32_t ip_ty
+                     ? (int64_t)timeout_ns
+                     : os_time_get_absolute_timeout(timeout_ns);
+    *expired = ps4_wait_seq(dev, fence_seq_no, abs);
++   /* RADV_DEBUG=hang checks each submission with a 1 s wait: report before it gives up. */
++   if (!*expired && timeout_ns >= 500000000ull)
++      ps4_report_hang(dev, fence_seq_no);
+    return 0;
+ }
+ 
+@@ -767,8 +953,21 @@ ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_hand
+    dcb[num_ibs] = fence_ib;
+    dcb_sizes[num_ibs] = (cs - fence_ib) * 4;
+ 
++   {
++      const unsigned slot = seq % ARRAY_SIZE(dev->recent);
++      dev->recent[slot].seq = seq;
++      dev->recent[slot].num_ibs = MIN2(num_ibs, ARRAY_SIZE(dev->recent[slot].va));
++      for (unsigned i = 0; i < dev->recent[slot].num_ibs; i++) {
++         dev->recent[slot].va[i] = (uintptr_t)dcb[i];
++         dev->recent[slot].bytes[i] = dcb_sizes[i];
++      }
++   }
+    int r = dev->submit(num_ibs + 1, dcb, dcb_sizes, ccb, ccb_sizes);
+    dev->submit_done();
++   if (seq <= 40 || seq % 1000 == 0)
++      ps4_log("radv/ps4: submit %llu: %u IBs (first %p, %u bytes) = %#x, GPU completed %llu\n",
++              (unsigned long long)seq, num_ibs, dcb[0], dcb_sizes[0], r,
++              (unsigned long long)ps4_completed(dev));
+    if (r) {
+       ps4_log("radv/ps4: sceGnmSubmitCommandBuffers(%u IBs) = %#x\n", num_ibs + 1, r);
+       dev->last_seq--;
+@@ -918,6 +1117,7 @@ ps4_wait_common(ac_drm_device *dev, uint32_t *handles, uint64_t *points, unsigne
+    const bool available = flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE;
+    const bool for_submit = flags & (DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE);
+    unsigned spins = 0;
++   int64_t wait_start = 0;
+    for (;;) {
+       unsigned done = 0, first_done = ~0u;
+       simple_mtx_lock(&dev->lock);
+@@ -955,6 +1155,10 @@ ps4_wait_common(ac_drm_device *dev, uint32_t *handles, uint64_t *points, unsigne
+       }
+       if (abs_timeout <= 0 || (abs_timeout != INT64_MAX && os_time_get_nano() >= abs_timeout))
+          return -ETIME;
++      if (!wait_start)
++         wait_start = os_time_get_nano();
++      else if (os_time_get_nano() - wait_start > 2000000000ll && ps4_completed(dev) < dev->last_seq)
++         ps4_report_hang(dev, ps4_completed(dev) + 1);
+       if (++spins > 64)
+          sceKernelUsleep(50);
+    }
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index 405023b..9aa348a 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -1707,7 +1707,7 @@ radv_cmd_buffer_after_draw(struct radv_cmd_buffer *cmd_buffer, enum radv_cmd_flu
+       }
+    }
+ 
+-   if (radv_device_fault_detection_enabled(device))
++   if (radv_device_fault_detection_enabled(device) || device->trace_bo)
+       radv_cmd_buffer_trace_emit(cmd_buffer);
+ }
+ 
+@@ -7774,7 +7774,7 @@ radv_BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBegi
+          cmd_buffer->state.dirty |= RADV_CMD_DIRTY_OCCLUSION_QUERY;
+    }
+ 
+-   if (radv_device_fault_detection_enabled(device))
++   if (radv_device_fault_detection_enabled(device) || device->trace_bo)
+       radv_cmd_buffer_trace_emit(cmd_buffer);
+ 
+    if (radv_spm_trace_enabled(pdev) && (cmd_buffer->qf == RADV_QUEUE_GENERAL || cmd_buffer->qf == RADV_QUEUE_COMPUTE)) {
+@@ -14612,7 +14612,7 @@ radv_emit_cache_flush(struct radv_cmd_buffer *cmd_buffer)
+                             cmd_buffer->gfx9_fence_va, cmd_buffer->state.flush_bits, &cmd_buffer->state.sqtt_flush_bits,
+                             cmd_buffer->gfx9_eop_bug_va);
+ 
+-   if (radv_device_fault_detection_enabled(device))
++   if (radv_device_fault_detection_enabled(device) || device->trace_bo)
+       radv_cmd_buffer_trace_emit(cmd_buffer);
+ 
+    if (cmd_buffer->state.flush_bits & RADV_CMD_FLAG_INV_L2)
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+index 4113b96..39ab1f5 100644
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -668,8 +668,13 @@ radv_device_init_device_fault_detection(struct radv_device *device)
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+    struct radv_instance *instance = radv_physical_device_instance(pdev);
+ 
+-   if (!radv_device_fault_detection_enabled(device))
++   if (!radv_device_fault_detection_enabled(device)) {
++#ifdef __PS4__
++      if (os_get_option("RADV_PS4_TRACE") && !radv_init_trace(device))
++         return VK_ERROR_INITIALIZATION_FAILED;
++#endif
+       return VK_SUCCESS;
++   }
+ 
+    if (!radv_init_trace(device))
+       return VK_ERROR_INITIALIZATION_FAILED;
+-- 
+2.53.0
+
