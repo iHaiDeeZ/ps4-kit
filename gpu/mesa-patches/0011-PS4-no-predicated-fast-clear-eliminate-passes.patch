@@ -1,7 +1,7 @@
 From 473f05f9364dd7c462e52687def4bba6a09c54be Mon Sep 17 00:00:00 2001
 From: ShiroKlein <23220202+iHaiDeeZ@users.noreply.github.com>
 Date: Fri, 2 Oct 2026 22:32:46 +0300
-Subject: [PATCH 11/28] PS4: no predicated fast-clear-eliminate passes
+Subject: [PATCH 11/29] PS4: no predicated fast-clear-eliminate passes
 
 ---
  src/amd/common/ac_ps4_drm.c                | 101 +++++++++++++++++++--

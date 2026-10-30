@@ -1,7 +1,7 @@
 From 30be9db3b1b8d95144f207a71e0ad9d6d36b9746 Mon Sep 17 00:00:00 2001
 From: ShiroKlein <23220202+iHaiDeeZ@users.noreply.github.com>
 Date: Fri, 2 Oct 2026 17:55:00 +0300
-Subject: [PATCH 07/28] PS4: map buffers through ac_drm_bo_cpu_map, never
+Subject: [PATCH 07/29] PS4: map buffers through ac_drm_bo_cpu_map, never
  munmap
 
 ---

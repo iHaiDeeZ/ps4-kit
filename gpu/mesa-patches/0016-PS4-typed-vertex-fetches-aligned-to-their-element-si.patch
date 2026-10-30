@@ -1,7 +1,7 @@
 From a2527757729ebd489c2820127ae25d6e8c052853 Mon Sep 17 00:00:00 2001
 From: ShiroKlein <ihaideezi@gmail.com>
 Date: Sat, 17 Oct 2026 02:48:05 +0300
-Subject: [PATCH 16/28] PS4: typed vertex fetches aligned to their element
+Subject: [PATCH 16/29] PS4: typed vertex fetches aligned to their element
  size, as on gfx6 (Liverpool read an 8_8 fetch at an odd address wrong)
 
 ---

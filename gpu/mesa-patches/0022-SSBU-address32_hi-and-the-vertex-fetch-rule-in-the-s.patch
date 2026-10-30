@@ -1,7 +1,7 @@
 From 713601e6e34378c5a27e6bcd0ab3164ee4583cd8 Mon Sep 17 00:00:00 2001
 From: ShiroKlein <ihaideezi@gmail.com>
 Date: Wed, 21 Oct 2026 08:02:12 +0300
-Subject: [PATCH 22/28] SSBU: address32_hi and the vertex fetch rule in the
+Subject: [PATCH 22/29] SSBU: address32_hi and the vertex fetch rule in the
  shader cache's identity
 
 ---
