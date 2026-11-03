@@ -176,8 +176,7 @@ char g_nameCode[32] = "ps4 code";
 int clampInt(int value, int lo, int hi) { return value < lo ? lo : value > hi ? hi : value; }
 
 void loadOptions() {
-    if (ps4_kit_configure_heap)
-        ps4_kit_configure_heap(&g_opt);
+    ps4_kit_configure_heap(&g_opt);  // (the app's, or the weak no-op above)
     if (!g_opt.log_tag || !g_opt.log_tag[0])
         g_opt.log_tag = "ps4";
     g_opt.max_arenas = clampInt(g_opt.max_arenas, 0, MAX_ARENAS_CAP);
@@ -459,6 +458,13 @@ mspace createHeap() {
             continue;
         if (mspace msp = mapAndCreate(true, size))
             return msp;
+    }
+    // A process forked by the app reads a nonsense amount (~2^64 bytes): halving from there asked for
+    // 512 GiB, 256 GiB, ... and the whole PS4 froze at the 4 GiB request (WinePS4 v00.40/41). The
+    // console has 8 GiB in all; more than that is not believed.
+    if (ret == 0 && available > 8192 * MB) {
+        heapLog("heap: %zu MiB of flexible memory available is not possible: none of it taken\n", available / MB);
+        available = 0;
     }
     size_t size = 0;
     if (ret == 0 && available > g_opt.regular_reserve + 32 * MB)

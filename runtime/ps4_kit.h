@@ -73,8 +73,10 @@ typedef struct ps4_kit_heap_options {
     int max_auto_arenas;
 } ps4_kit_heap_options;
 
-// Optional, defined by the app (weak here).
-void ps4_kit_configure_heap(ps4_kit_heap_options* options) __attribute__((weak));
+// Optional, defined by the app. Not declared weak here: an app's definition after this declaration
+// would be weak too, and the linker kept the runtime's empty one instead (WinePS4 v00.33-v00.41:
+// none of its settings ever applied). The runtime's no-op is the weak one.
+void ps4_kit_configure_heap(ps4_kit_heap_options* options);
 
 // --- Heap: per-thread arenas -------------------------------------------------------------------
 //
