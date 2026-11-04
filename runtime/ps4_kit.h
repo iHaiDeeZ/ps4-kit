@@ -71,6 +71,17 @@ typedef struct ps4_kit_heap_options {
     int auto_arena_waits;
     size_t auto_arena_size;
     int max_auto_arenas;
+    // Nonzero: everything the runtime maps (the heaps, large mmaps, code, its own tables) comes from
+    // regular flexible memory: no direct memory, no system pool, no overflow heaps. For a process
+    // the app starts outside the system's own processes of the app (WinePS4's past the PS4's 7):
+    // what the app's suspend and close tear down (its direct memory, its GPU space) must hold none
+    // of its mappings (forked processes with direct memory: "gbase_free_vm_space_2 has mapped
+    // memory", then a kernel panic). Default 0.
+    int regular_only;
+    // regular_only: the main heap's size, tried from here down by halves to 16 MiB. The kernel's
+    // free figure is not used: a process the app started itself reads ~2^64, and nothing stops it
+    // taking the console's memory (a 4 GiB request froze the PS4). Default 64 MiB.
+    size_t regular_max;
 } ps4_kit_heap_options;
 
 // Optional, defined by the app. Not declared weak here: an app's definition after this declaration

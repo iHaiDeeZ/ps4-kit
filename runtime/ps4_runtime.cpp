@@ -167,6 +167,8 @@ constinit ps4_kit_heap_options g_opt = {
     32,                         // auto_arena_waits
     4 * MB,                     // auto_arena_size
     12,                         // max_auto_arenas
+    0,                          // regular_only
+    64 * MB,                    // regular_max
 };
 // The kernel's names for our mappings (shown in its memory listings), from the log tag.
 char g_nameHeap[32] = "ps4 heap";
@@ -439,6 +441,15 @@ mspace createHeap() {
         pthread_mutexattr_destroy(reinterpret_cast<pthread_mutexattr_t*>(attr));
     }
     const size_t candidates[] = {1024 * MB, 768 * MB, 512 * MB, 384 * MB, 256 * MB, 192 * MB, 128 * MB};
+    if (g_opt.regular_only) {
+        // regular flexible memory only, from regular_max down (see ps4_kit.h)
+        for (size_t size = g_opt.regular_max & ~(PAGE - 1); size >= 16 * MB; size = (size / 2) & ~(PAGE - 1)) {
+            if (mspace msp = mapAndCreate(false, size))
+                return msp;
+        }
+        heapLog("heap: could not create a heap in regular flexible memory\n");
+        return nullptr;
+    }
     if (g_opt.source_order == PS4_KIT_HEAP_DIRECT_FIRST) {
         for (size_t size : candidates) {
             if (size > g_opt.direct_max || size < 256 * MB)
@@ -572,6 +583,8 @@ void countChunk(int i, const void* p, int64_t sign) {
 
 // Maps one more overflow heap; false if none could be (no direct memory to spare, or all in use)
 bool addOverflowHeap(int seen) {
+    if (g_opt.regular_only)
+        return false;  // (direct memory)
     g_overflowLock.lock();
     const int count = __atomic_load_n(&g_overflowCount, __ATOMIC_ACQUIRE);
     int slot = -1;
@@ -1198,7 +1211,7 @@ void createThreadDtorKey() { pthread_key_create(&g_threadDtorKey, runThreadDtors
 // memory, else a plain mmap.
 void* mapRuntimeMemory(size_t size) {
     size = (size + PAGE - 1) & ~(PAGE - 1);
-    if (void* base = reserveAwayFromKernel(size)) {
+    if (void* base = g_opt.regular_only ? nullptr : reserveAwayFromKernel(size)) {
         if (ps4k_sceKernelMapNamedSystemFlexibleMemory(&base, size, PROT_CPU_RW, MAP_FIXED_FLAG, g_nameMmap) == 0)
             return base;
         ps4k_sceKernelMunmap(base, size);
@@ -1699,8 +1712,10 @@ ExecSource chooseExecSource() {
     }
     // The system pool first (it keeps regular flexible memory for the GPU driver), then the plain
     // ways, then the ones some jailbreaks allow instead.
-    for (int s = ps4_jit_in_system_pool ? kExecSystemPool : kExecRegular; s < kExecNone; s++) {
+    for (int s = ps4_jit_in_system_pool && !g_opt.regular_only ? kExecSystemPool : kExecRegular; s < kExecNone; s++) {
         const ExecSource source = static_cast<ExecSource>(s);
+        if (g_opt.regular_only && source != kExecRegular && source != kExecMprotect && source != kExecFlexible)
+            continue;
         off_t phys = 0;
         void* code = mapExec(source, PAGE, &phys);
         if (!code) {
@@ -1904,7 +1919,7 @@ void* __wrap_mmap(void* addr, size_t len, int prot, int flags, int fd, off_t off
     }
     static std::atomic<unsigned> s_mapped{0};
     unsigned n = 0;
-    if (anonymous && len >= MB) {
+    if (anonymous && len >= MB && !g_opt.regular_only) {
         const size_t size = (len + PAGE - 1) & ~(PAGE - 1);
         void* base = reserveAwayFromKernel(size);
         if (base) {
