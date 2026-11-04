@@ -75,8 +75,10 @@ plain)
     # Plain OpenOrbis/PSChrome values (known to launch with the default PAID).
     set_entry APP_TYPE Integer 4 1
     # 0x2: system dialogs (the keyboard) confirm with Cross. Without it they follow the console's
-    # region default, which is Circle on some consoles (DolphinPS4 Lab's fix).
-    set_entry ATTRIBUTE Integer 4 0x2
+    # region default, which is Circle on some consoles (DolphinPS4 Lab's fix). SFO_ATTRIBUTE replaces
+    # it, e.g. 0x800002 adds 0x800000, "supports NEO mode": a PS4 Pro runs the app at its own clocks
+    # (CPU 2.13 GHz instead of 1.6) without Boost Mode.
+    set_entry ATTRIBUTE Integer 4 "${SFO_ATTRIBUTE:-0x2}"
     set_entry CATEGORY Utf8 4 gd
     set_entry SYSTEM_VER Integer 4 0 ;;
 *)
