@@ -541,6 +541,9 @@ mspace g_overflow[MAX_OVERFLOW_CAP] = {};  // nullptr: slot free (never used, or
 uintptr_t g_overflowBase[MAX_OVERFLOW_CAP] = {};
 size_t g_overflowSize[MAX_OVERFLOW_CAP] = {};
 off_t g_overflowPhys[MAX_OVERFLOW_CAP] = {};
+// the size of this thread's allocation now being made (an overflow heap of regular flexible memory
+// takes it whole)
+__attribute__((tls_model("initial-exec"))) thread_local size_t t_want = 0;
 constinit std::atomic<int64_t> g_overflowInUse[MAX_OVERFLOW_CAP];
 constinit std::atomic<int> g_overflowPins[MAX_OVERFLOW_CAP];
 constinit std::atomic<bool> g_overflowClosing[MAX_OVERFLOW_CAP];
@@ -582,9 +585,37 @@ void countChunk(int i, const void* p, int64_t sign) {
 }
 
 // Maps one more overflow heap; false if none could be (no direct memory to spare, or all in use)
+// regular_only: one more heap of regular flexible memory, regular_max big, or as big as the request
+// (t_want) that did not fit (see ps4_kit.h); its slot's phys is -1
+bool addRegularOverflowHeap(int slot, int count) {
+    const size_t want = (t_want + MB + MB - 1) & ~(MB - 1);
+    const size_t size = want > g_opt.regular_max ? want : g_opt.regular_max;
+    void* base = reserveAwayFromKernel(size);
+    if (!base)
+        return false;
+    if (ps4k_sceKernelMapNamedFlexibleMemory(&base, size, PROT_CPU_RW, MAP_FIXED_FLAG, g_nameHeap) != 0) {
+        ps4k_sceKernelMunmap(base, size);
+        return false;
+    }
+    mspace msp = create_mspace_with_base(base, size, 1);
+    if (!msp) {
+        ps4k_sceKernelMunmap(base, size);
+        return false;
+    }
+    g_overflowBase[slot] = reinterpret_cast<uintptr_t>(base);
+    g_overflowPhys[slot] = -1;
+    g_overflowInUse[slot].store(0);
+    g_overflowEmptyTicks[slot] = 0;
+    __atomic_store_n(&g_overflowSize[slot], size, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_overflow[slot], msp, __ATOMIC_RELEASE);
+    if (slot == count)
+        __atomic_store_n(&g_overflowCount, count + 1, __ATOMIC_RELEASE);
+    heapLog("heap: heaps full: overflow heap %d of %d, %zu MiB of regular flexible memory at %p\n", slot + 1,
+            g_opt.max_overflow_heaps, size / MB, base);
+    return true;
+}
+
 bool addOverflowHeap(int seen) {
-    if (g_opt.regular_only)
-        return false;  // (direct memory)
     g_overflowLock.lock();
     const int count = __atomic_load_n(&g_overflowCount, __ATOMIC_ACQUIRE);
     int slot = -1;
@@ -594,7 +625,12 @@ bool addOverflowHeap(int seen) {
     if (slot < 0 && count < g_opt.max_overflow_heaps)
         slot = count;
     bool added = count != seen;  // another thread added one meanwhile: try that first
-    if (!added && slot >= 0 && !g_overflowExhausted) {
+    if (!added && slot >= 0 && !g_overflowExhausted && g_opt.regular_only) {
+        if (!(added = addRegularOverflowHeap(slot, count))) {
+            g_overflowExhausted = true;
+            heapLog("heap: heaps full and no regular flexible memory for another overflow heap\n");
+        }
+    } else if (!added && slot >= 0 && !g_overflowExhausted) {
         const size_t sizes[] = {512 * MB, 384 * MB, 256 * MB, 128 * MB};
         size_t largest = 0;
         for (size_t size : sizes) {
@@ -929,9 +965,11 @@ void trimOverflowHeaps() {
             __atomic_store_n(&g_overflow[i], static_cast<mspace>(nullptr), __ATOMIC_RELEASE);
             __atomic_store_n(&g_overflowSize[i], static_cast<size_t>(0), __ATOMIC_RELEASE);
             ps4k_sceKernelMunmap(reinterpret_cast<void*>(g_overflowBase[i]), size);
-            ps4k_sceKernelReleaseDirectMemory(g_overflowPhys[i], size);
+            if (g_overflowPhys[i] != -1)  // (-1: regular flexible memory, gone with the unmap)
+                ps4k_sceKernelReleaseDirectMemory(g_overflowPhys[i], size);
             g_overflowExhausted = false;
-            heapLog("heap: overflow heap %d empty: its %zu MiB of direct memory given back\n", i + 1, size / MB);
+            heapLog("heap: overflow heap %d empty: its %zu MiB of %s memory given back\n", i + 1, size / MB,
+                    g_overflowPhys[i] != -1 ? "direct" : "regular flexible");
         }
         g_overflowEmptyTicks[i] = 0;
         g_overflowClosing[i].store(false, std::memory_order_release);
@@ -1240,6 +1278,7 @@ void ps4_heap_error(void* msp, void* chunk, int corruption) {
 void* __wrap_malloc(size_t size) {
     t_op = "malloc";
     t_caller = __builtin_return_address(0);
+    t_want = size;
     checkHeap(t_op, t_caller);
     void* p = allocate([&](mspace m) { return mspace_malloc(m, size); });
     if (!p)
@@ -1267,6 +1306,7 @@ void __wrap_free(void* ptr) {
 void* __wrap_calloc(size_t nelem, size_t size) {
     t_op = "calloc";
     t_caller = __builtin_return_address(0);
+    t_want = nelem * size;
     checkHeap(t_op, t_caller);
     void* p = allocate([&](mspace m) { return mspace_calloc(m, nelem, size); });
     if (!p)
@@ -1278,6 +1318,7 @@ void* __wrap_calloc(size_t nelem, size_t size) {
 void* __wrap_realloc(void* ptr, size_t size) {
     t_op = "realloc";
     t_caller = __builtin_return_address(0);
+    t_want = size;
     checkHeap(t_op, t_caller);
     if (ptr && !ownsPointer(ptr)) {
         heapLog("heap: realloc(%p) of memory not from this heap, caller elf 0x%llx\n", ptr, elf(t_caller));
@@ -1318,6 +1359,7 @@ void* __wrap_realloc(void* ptr, size_t size) {
 void* __wrap_memalign(size_t alignment, size_t size) {
     t_op = "memalign";
     t_caller = __builtin_return_address(0);
+    t_want = size + alignment;
     checkHeap(t_op, t_caller);
     void* p = allocate([&](mspace m) { return mspace_memalign(m, alignment, size); });
     if (!p)
