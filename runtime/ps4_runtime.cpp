@@ -169,6 +169,7 @@ constinit ps4_kit_heap_options g_opt = {
     12,                         // max_auto_arenas
     0,                          // regular_only
     64 * MB,                    // regular_max
+    512 * MB,                   // overflow_direct_max
 };
 // The kernel's names for our mappings (shown in its memory listings), from the log tag.
 char g_nameHeap[32] = "ps4 heap";
@@ -631,7 +632,15 @@ bool addOverflowHeap(int seen) {
             heapLog("heap: heaps full and no regular flexible memory for another overflow heap\n");
         }
     } else if (!added && slot >= 0 && !g_overflowExhausted) {
-        const size_t sizes[] = {512 * MB, 384 * MB, 256 * MB, 128 * MB};
+        // (overflow_direct_max and 3/4, 1/2, 1/4 of it; 16 MiB at least, and at least what did not fit)
+        const size_t top = g_opt.overflow_direct_max < 16 * MB ? 16 * MB : g_opt.overflow_direct_max;
+        const size_t need = (t_want + MB + 2 * MB - 1) & ~(2 * MB - 1);
+        size_t sizes[] = {top, top / 4 * 3, top / 2, top / 4};
+        for (size_t& size : sizes) {
+            size = (size + 2 * MB - 1) & ~(2 * MB - 1);
+            if (size < 16 * MB) size = 16 * MB;
+            if (size < need) size = need;
+        }
         size_t largest = 0;
         for (size_t size : sizes) {
             off_t largestStart = 0;

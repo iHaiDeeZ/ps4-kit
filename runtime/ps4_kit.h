@@ -85,6 +85,12 @@ typedef struct ps4_kit_heap_options {
     // figure is not used: a process the app forked once read ~2^64 (a 4 GiB request froze the
     // PS4). Default 64 MiB.
     size_t regular_max;
+    // The largest direct overflow heap: each is tried at this size, then 3/4, 1/2 and 1/4 of it (16 MiB
+    // at least, and never smaller than the allocation that did not fit). Default 512 MiB. A process
+    // whose heap mostly sits idle among many of the same app (WinePS4: a 64 MiB main heap in each of
+    // its program processes, 64 MiB more at a time) keeps it small: a direct mapping takes all of its
+    // size from the app's direct memory at once, used or not.
+    size_t overflow_direct_max;
 } ps4_kit_heap_options;
 
 // Optional, defined by the app. Not declared weak here: an app's definition after this declaration
