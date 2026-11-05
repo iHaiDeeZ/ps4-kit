@@ -1,7 +1,7 @@
 From 7d010de97ed0e5d3b02e0d7c6bf0c829298490c9 Mon Sep 17 00:00:00 2001
 From: ps4-kit <ps4-kit@localhost>
 Date: Mon, 19 Oct 2026 07:42:50 +0300
-Subject: [PATCH 21/29] PS4: GS rings at least ac_ps4_gs_ring_min (8 MiB) - the
+Subject: [PATCH 21/30] PS4: GS rings at least ac_ps4_gs_ring_min (8 MiB) - the
  VGT wraps them at a larger size than RADV programs
 
 ---

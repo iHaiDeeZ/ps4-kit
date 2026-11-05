@@ -1,7 +1,7 @@
 From e48d7ad24d13424fa5a265b6eb8f6e68bfcab076 Mon Sep 17 00:00:00 2001
 From: ShiroKlein <23220202+iHaiDeeZ@users.noreply.github.com>
 Date: Fri, 2 Oct 2026 13:44:12 +0300
-Subject: [PATCH 04/29] PS4: startup trace points
+Subject: [PATCH 04/30] PS4: startup trace points
 
 ---
  src/amd/common/ac_linux_drm.h                     |  1 +
