@@ -82,6 +82,13 @@ struct Swapchain {
     uint32_t flip_mode = ORBIS_VIDEO_OUT_FLIP_VSYNC;
     uint32_t pitch = 0;
     VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+    // window mode (set_window_present): the size asked for, presented to the hook, never registered with VideoOut
+    bool window = false;
+    bool coherent = true;  // (else the CPU's cache of the image is dropped before each present)
+    uint64_t surface = 0;
+    uint32_t width = kScreenWidth, height = kScreenHeight;
+    uint32_t row_bytes = 0;
+    uint8_t* pixels[kMaxImages]{};
 };
 
 VkInstance g_instance = VK_NULL_HANDLE;
@@ -115,6 +122,8 @@ std::atomic<void (*)(const char*)> g_log_hook{nullptr};
 std::atomic<int> g_max_steps{400};
 std::atomic<bool> g_stats_log{true};
 std::atomic<bool> g_force_vsync{false};
+std::atomic<WindowPresent> g_window_present{nullptr};
+void (*g_window_present_c)(unsigned long long, const void*, unsigned, unsigned, unsigned, int) = nullptr;
 
 void emit(const char* line) {
     if (auto hook = g_log_hook.load(std::memory_order_relaxed))
@@ -338,6 +347,11 @@ VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysica
     caps->currentExtent = {kScreenWidth, kScreenHeight};
     caps->minImageExtent = caps->currentExtent;
     caps->maxImageExtent = caps->currentExtent;
+    if (g_window_present.load()) {  // (a window: any size; the app's window system says which)
+        caps->currentExtent = {0xffffffffu, 0xffffffffu};
+        caps->minImageExtent = {1, 1};
+        caps->maxImageExtent = {4096, 4096};
+    }
     caps->maxImageArrayLayers = 1;
     caps->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     caps->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
@@ -466,12 +480,101 @@ void release_retired() {
     g_retired_count = g_retired.size();
 }
 
+// Window mode's memory: host-visible, cached for the CPU's reads where there is such a type (the frames are read by the
+// CPU at each present), else the device-local host-visible one.
+uint32_t readback_type(uint32_t bits, bool* coherent) {
+    VkPhysicalDeviceMemoryProperties props;
+    instance_fn<PFN_vkGetPhysicalDeviceMemoryProperties>("vkGetPhysicalDeviceMemoryProperties")(g_physical, &props);
+    const VkMemoryPropertyFlags tries[] = {
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+    for (const VkMemoryPropertyFlags want : tries)
+        for (uint32_t k = 0; k < props.memoryTypeCount; k++)
+            if ((bits & (1u << k)) && (props.memoryTypes[k].propertyFlags & want) == want) {
+                *coherent = (props.memoryTypes[k].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+                return k;
+            }
+    return UINT32_MAX;
+}
+
+// A window mode swapchain (g_lock held): images of the size asked for, nothing of VideoOut's.
+VkResult create_window_swapchain(VkDevice device, const VkSwapchainCreateInfoKHR* info, VkSwapchainKHR* swapchain) {
+    auto sc = new Swapchain();
+    sc->device = device;
+    sc->window = true;
+    sc->surface = uint64_t(info->surface);
+    sc->image_count = std::clamp<uint32_t>(info->minImageCount, 2, kMaxImages);
+    sc->width = std::clamp<uint32_t>(info->imageExtent.width, 1, 4096);
+    sc->height = std::clamp<uint32_t>(info->imageExtent.height, 1, 4096);
+    const bool bgra = info->imageFormat == VK_FORMAT_B8G8R8A8_UNORM || info->imageFormat == VK_FORMAT_B8G8R8A8_SRGB;
+    sc->format = bgra ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
+    if (info->imageFormat != sc->format)
+        log("ps4kit/wsi: format %d asked for, made %d", int(info->imageFormat), int(sc->format));
+    auto create_image = device_fn<PFN_vkCreateImage>(device, "vkCreateImage");
+    auto requirements = device_fn<PFN_vkGetImageMemoryRequirements>(device, "vkGetImageMemoryRequirements");
+    auto allocate = device_fn<PFN_vkAllocateMemory>(device, "vkAllocateMemory");
+    auto map = device_fn<PFN_vkMapMemory>(device, "vkMapMemory");
+    auto bind = device_fn<PFN_vkBindImageMemory>(device, "vkBindImageMemory");
+    auto layout_of = device_fn<PFN_vkGetImageSubresourceLayout>(device, "vkGetImageSubresourceLayout");
+    VkImageUsageFlags usage = info->imageUsage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if ((usage & VK_IMAGE_USAGE_STORAGE_BIT) && !linear_storage(g_physical, sc->format))
+        usage &= ~VkImageUsageFlags(VK_IMAGE_USAGE_STORAGE_BIT);
+    for (uint32_t k = 0; k < sc->image_count; k++) {
+        VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = sc->format;
+        ici.extent = {sc->width, sc->height, 1};
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_LINEAR;
+        ici.usage = usage;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkResult r = create_image(device, &ici, nullptr, &sc->images[k]);
+        if (r != VK_SUCCESS) {
+            log("ps4kit/wsi: window image %ux%u: vkCreateImage failed: %d", sc->width, sc->height, int(r));
+            free_swapchain(sc);
+            return r;
+        }
+        VkMemoryRequirements req;
+        requirements(device, sc->images[k], &req);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = readback_type(req.memoryTypeBits, &sc->coherent);
+        if (mai.memoryTypeIndex == UINT32_MAX) {
+            log("ps4kit/wsi: no host-visible memory type for a window swapchain (types %#x)", req.memoryTypeBits);
+            free_swapchain(sc);
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+        uint8_t* base = nullptr;
+        r = allocate(device, &mai, nullptr, &sc->memory[k]);
+        if (r == VK_SUCCESS) r = map(device, sc->memory[k], 0, VK_WHOLE_SIZE, 0, reinterpret_cast<void**>(&base));
+        if (r == VK_SUCCESS) r = bind(device, sc->images[k], sc->memory[k], 0);
+        if (r != VK_SUCCESS) {
+            log("ps4kit/wsi: window swapchain memory failed: %d", int(r));
+            free_swapchain(sc);
+            return r;
+        }
+        VkImageSubresource sub{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
+        VkSubresourceLayout layout;
+        layout_of(device, sc->images[k], &sub, &layout);
+        sc->pixels[k] = base + layout.offset;
+        sc->row_bytes = uint32_t(layout.rowPitch);
+    }
+    log("ps4kit/wsi: window swapchain of %u images %ux%u %s, rows of %u bytes, %s memory", sc->image_count, sc->width,
+        sc->height, bgra ? "B8G8R8A8" : "R8G8B8A8", sc->row_bytes, sc->coherent ? "coherent" : "cached");
+    *swapchain = reinterpret_cast<VkSwapchainKHR>(sc);
+    return VK_SUCCESS;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR* info,
                                                   const VkAllocationCallbacks*, VkSwapchainKHR* swapchain) {
     step("wsi: CreateSwapchainKHR %u images %ux%u format %d mode %d usage %#x", info->minImageCount,
          info->imageExtent.width, info->imageExtent.height, int(info->imageFormat), int(info->presentMode),
          unsigned(info->imageUsage));
     std::lock_guard lk(g_lock);
+    if (g_window_present.load()) return create_window_swapchain(device, info, swapchain);
     if (!open_video_out()) return VK_ERROR_INITIALIZATION_FAILED;
     auto sc = new Swapchain();
     sc->device = device;
@@ -750,6 +853,7 @@ VKAPI_ATTR VkResult VKAPI_CALL AcquireNextImage2KHR(VkDevice device, const VkAcq
 
 VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* info) {
     VkResult result = VK_SUCCESS;
+    bool waited = false;
     for (uint32_t k = 0; k < info->swapchainCount; k++) {
         auto sc = reinterpret_cast<Swapchain*>(info->pSwapchains[k]);
         const uint32_t image = info->pImageIndices[k];
@@ -757,6 +861,23 @@ VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPresentInf
             log("ps4kit/wsi: present of image %u of %u", image, sc->image_count);
             if (info->pResults) info->pResults[k] = VK_ERROR_OUT_OF_DATE_KHR;
             result = VK_ERROR_OUT_OF_DATE_KHR;
+            continue;
+        }
+        if (sc->window) {  // the GPU's frame, once drawn, to the hook (its pixels stay until acquired again)
+            if (!waited) device_fn<PFN_vkQueueWaitIdle>(sc->device, "vkQueueWaitIdle")(queue);
+            waited = true;
+            if (!sc->coherent) {
+                VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+                range.memory = sc->memory[image];
+                range.size = VK_WHOLE_SIZE;
+                device_fn<PFN_vkInvalidateMappedMemoryRanges>(sc->device, "vkInvalidateMappedMemoryRanges")(sc->device,
+                                                                                                          1, &range);
+            }
+            if (auto hook = g_window_present.load())
+                hook(sc->surface, sc->pixels[image], sc->width, sc->height, sc->row_bytes,
+                     sc->format == VK_FORMAT_B8G8R8A8_UNORM);
+            count_present();
+            if (info->pResults) info->pResults[k] = VK_SUCCESS;
             continue;
         }
         const uint32_t buffer = uint32_t(sc->first_buffer) + image;
@@ -985,6 +1106,8 @@ std::atomic<double> g_vblank_rate{0};
 
 void* vk_get_instance_proc_addr() { return reinterpret_cast<void*>(&GetInstanceProcAddr); }
 
+void set_window_present(WindowPresent hook) { g_window_present = hook; }
+
 bool video_out_open() { return open_video_out(); }
 
 int video_handle() { return open_video_out() ? g_video : -1; }
@@ -1085,6 +1208,18 @@ void set_force_vsync(bool on) { g_force_vsync = on; }
 }  // namespace ps4kit
 
 extern "C" void* ps4kit_vk_get_instance_proc_addr(void) { return ps4kit::vk_get_instance_proc_addr(); }
+
+extern "C" void ps4kit_set_log(void (*log)(const char* line)) { ps4kit::set_log(log); }
+
+extern "C" void ps4kit_set_window_present(void (*hook)(unsigned long long surface, const void* pixels, unsigned width,
+                                                       unsigned height, unsigned row_bytes, int bgra)) {
+    ps4kit::g_window_present_c = hook;
+    ps4kit::WindowPresent present = nullptr;
+    if (hook)
+        present = [](uint64_t surface, const void* pixels, uint32_t width, uint32_t height, uint32_t row_bytes,
+                     bool bgra) { ps4kit::g_window_present_c(surface, pixels, width, height, row_bytes, bgra ? 1 : 0); };
+    ps4kit::set_window_present(present);
+}
 
 extern "C" int ps4kit_video_handle(void) { return ps4kit::video_handle(); }
 

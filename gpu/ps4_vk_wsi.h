@@ -83,6 +83,18 @@ struct PresentStats {
 };
 PresentStats present_stats();
 
+// --- Presenting into an app's own windows ---------------------------------------------------------------------------
+
+// A presenter in place of VideoOut, for an app that shows the frames itself (WinePS4: in a program's window on its
+// desktop, whose process doesn't have VideoOut). Once set, swapchains are made at the size asked for (1 to 4096 a
+// side), their images linear in host-visible memory the CPU reads (cached where there is such a type), and a present
+// waits for the GPU, then hands each image to the hook: the surface the swapchain was made for, the pixels (row_bytes
+// apart), the size, and whether it is B8G8R8A8 (else R8G8B8A8). The pixels stay until the image is acquired again.
+// The surfaces' capabilities then take any size. Set it before the first swapchain is made.
+using WindowPresent = void (*)(uint64_t surface, const void* pixels, uint32_t width, uint32_t height,
+                               uint32_t row_bytes, bool bgra);
+void set_window_present(WindowPresent hook);
+
 // --- Options (all may change at any time) --------------------------------------------------------------------------
 
 // Where the WSI's log lines go. Default (nullptr): ps4_boot_trace() of the kit's ps4_crashlog.cpp when it is
@@ -115,6 +127,11 @@ inline PFN_vkGetInstanceProcAddr vk_get_instance_proc_addr_fn() {
 // dxvk_ps4_vk_get_instance_proc_addr; that one is weak so an app may define its own).
 extern "C" {
 void* ps4kit_vk_get_instance_proc_addr(void);
+// set_log() for C
+void ps4kit_set_log(void (*log)(const char* line));
+// set_window_present() for C (bgra: 1 for B8G8R8A8, 0 for R8G8B8A8)
+void ps4kit_set_window_present(void (*hook)(unsigned long long surface, const void* pixels, unsigned width,
+                                            unsigned height, unsigned row_bytes, int bgra));
 int ps4kit_video_handle(void);
 unsigned long long ps4kit_flip_count(void);
 }
