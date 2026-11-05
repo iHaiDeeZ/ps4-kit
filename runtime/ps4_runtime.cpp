@@ -452,6 +452,14 @@ mspace createHeap() {
         return nullptr;
     }
     if (g_opt.source_order == PS4_KIT_HEAP_DIRECT_FIRST) {
+        // A direct_max under 256 MiB is a small heap meant to grow by overflow heaps (WinePS4's program
+        // processes): that size itself. (The sizes below were never tried under 256 MiB, and WinePS4
+        // v00.59's 64 MiB heaps went to the system pool instead: every program took 128 MiB of what the PS4
+        // lives on, until "Failed to create the system memory" closed the app.)
+        if (g_opt.direct_max >= 16 * MB && g_opt.direct_max < 256 * MB) {
+            if (mspace msp = createDirectHeap((g_opt.direct_max + 2 * MB - 1) & ~(2 * MB - 1)))
+                return msp;
+        }
         for (size_t size : candidates) {
             if (size > g_opt.direct_max || size < 256 * MB)
                 continue;
