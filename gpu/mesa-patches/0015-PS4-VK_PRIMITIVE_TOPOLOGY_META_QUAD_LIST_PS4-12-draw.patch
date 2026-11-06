@@ -1,7 +1,7 @@
 From 18a043229cb584cd2b713f1ecb658749fb63453d Mon Sep 17 00:00:00 2001
 From: ShiroKlein <ihaideezi@gmail.com>
 Date: Fri, 16 Oct 2026 06:07:17 +0300
-Subject: [PATCH 15/30] PS4: VK_PRIMITIVE_TOPOLOGY_META_QUAD_LIST_PS4 (12)
+Subject: [PATCH 15/31] PS4: VK_PRIMITIVE_TOPOLOGY_META_QUAD_LIST_PS4 (12)
  draws the GPU s own quad lists (DI_PT_QUADLIST)
 
 ---

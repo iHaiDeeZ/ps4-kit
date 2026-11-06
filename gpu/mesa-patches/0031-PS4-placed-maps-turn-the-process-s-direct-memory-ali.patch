@@ -1,0 +1,66 @@
+From 089e6ec93a4c508fe0a4c172df82ccb41e4ebd0e Mon Sep 17 00:00:00 2001
+From: ps4-kit <ps4-kit@localhost>
+Date: Fri, 6 Nov 2026 06:08:34 +0300
+Subject: [PATCH 31/31] PS4: placed maps turn the process's direct memory
+ aliasing on first (sceKernelEnableDmemAliasing: the kernel refuses a second
+ mapping of direct memory without it, and WinePS4 v00.66's 32-bit game failed
+ every placed map), and say the kernel's error when one fails
+
+---
+ src/amd/common/ac_ps4_drm.c | 26 +++++++++++++++++++++++---
+ 1 file changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/src/amd/common/ac_ps4_drm.c b/src/amd/common/ac_ps4_drm.c
+index 95f6c30..18ce9a6 100644
+--- a/src/amd/common/ac_ps4_drm.c
++++ b/src/amd/common/ac_ps4_drm.c
+@@ -41,6 +41,7 @@ int sceKernelMapDirectMemory(void **addr, size_t len, int prot, int flags, off_t
+                              size_t align);
+ int sceKernelReserveVirtualRange(void **addr, size_t len, int flags, size_t align);
+ int sceKernelMunmap(void *addr, size_t len);
++int sceKernelEnableDmemAliasing(void);
+ size_t sceKernelGetDirectMemorySize(void);
+ int sceKernelUsleep(unsigned int usec);
+ const char *sceKernelGetFsSandboxRandomWord(void);
+@@ -1381,16 +1382,35 @@ ac_drm_bo_cpu_unmap(ac_drm_device *dev, ac_drm_bo bo)
+    return 0;
+ }
+ 
++/* A second mapping of a buffer's direct memory (its first is at its GPU address): the kernel refuses
++ * memory that is mapped already unless the process turned aliasing on (sceKernelEnableDmemAliasing;
++ * WinePS4 v00.66's 32-bit game failed every placed map without it). Once a process. */
++static bool
++ps4_dmem_aliasing(void)
++{
++   static int state; /* 0 not asked yet, 1 on, -1 refused */
++
++   if (!state) {
++      const int ret = sceKernelEnableDmemAliasing();
++      state = ret ? -1 : 1;
++      ps4_log("radv/ps4: direct memory aliasing %s (%#x)\n", ret ? "refused" : "on", (unsigned)ret);
++   }
++   return state > 0;
++}
++
+ int
+ ac_ps4_bo_cpu_map_placed(ac_drm_device *dev, ac_drm_bo bo, void *addr)
+ {
+    struct amdgpu_bo *b = bo.abo;
+    void *at = addr;
++   int ret = -1;
+ 
++   ps4_dmem_aliasing();
+    if (b->placed || ((uintptr_t)addr & (PS4_PAGE - 1)) ||
+-       sceKernelMapDirectMemory(&at, b->size, PS4_PROT_CPU_RW, PS4_MAP_FIXED, b->phys, PS4_PAGE) || at != addr) {
+-      ps4_log("radv/ps4: placed cpu map of bo %u at %p (%#llx bytes) failed\n", b->handle, addr,
+-              (unsigned long long)b->size);
++       (ret = sceKernelMapDirectMemory(&at, b->size, PS4_PROT_CPU_RW, PS4_MAP_FIXED, b->phys, PS4_PAGE)) ||
++       at != addr) {
++      ps4_log("radv/ps4: placed cpu map of bo %u at %p (%#llx bytes) failed (%#x, at %p)\n", b->handle, addr,
++              (unsigned long long)b->size, (unsigned)ret, at);
+       return -ENOMEM;
+    }
+    if (b->write_combined)
+-- 
+2.53.0
+
