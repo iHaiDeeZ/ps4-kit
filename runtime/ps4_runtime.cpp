@@ -85,6 +85,7 @@ void* ps4k_scePthreadSelf(void) __asm__("scePthreadSelf");
 int ps4k_scePthreadSetaffinity(void* thread, uint64_t mask) __asm__("scePthreadSetaffinity");
 int ps4k_scePthreadGetaffinity(void* thread, uint64_t* mask) __asm__("scePthreadGetaffinity");
 int ps4k_scePthreadSetprio(void* thread, int prio) __asm__("scePthreadSetprio");
+int ps4k_scePthreadGetprio(void* thread, int* prio) __asm__("scePthreadGetprio");
 int32_t ps4k_sceKernelGetModuleList(int32_t* handles, size_t count, size_t* available)
     __asm__("sceKernelGetModuleList");
 int32_t ps4k_sceKernelGetModuleInfo(int32_t handle, void* info) __asm__("sceKernelGetModuleInfo");
@@ -2097,6 +2098,13 @@ int __wrap_pthread_once(pthread_once_t* once, void (*init)(void)) {
 // thread that wants others sets them itself.
 uint64_t ps4_new_thread_cores = 0;  // 0 until the first allocation reads the process's cores
 
+// The PS4 runs an app's threads by priority alone, with no turns among threads of the same one: a
+// thread that never waits keeps its core while threads of its priority that want one wait behind it
+// (WinePS4 v00.70: a web helper's six busy threads and a game's loading held all seven cores, and
+// the desktop's loop and wineserver stood). A process whose threads must yield to another's, or win
+// over them, gives its new threads a priority of their own (0: the system's, inherited).
+int ps4_new_thread_priority = 0;
+
 }  // extern "C"
 
 namespace {
@@ -2130,6 +2138,8 @@ __attribute__((noinline, disable_tail_calls)) void* ps4_thread_entry(void* raw) 
     const ThreadStart start = *static_cast<ThreadStart*>(raw);
     free(raw);
     ps4k_scePthreadSetaffinity(ps4k_scePthreadSelf(), newThreadCores());
+    if (ps4_new_thread_priority)
+        ps4k_scePthreadSetprio(ps4k_scePthreadSelf(), ps4_new_thread_priority);
     if (ps4_install_signal_stack)
         ps4_install_signal_stack();
     // in the stack dumps (crash.log, hang.log) from the start; a thread that names itself later
@@ -2186,6 +2196,12 @@ int __wrap_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (
 void ps4_kit_set_new_thread_cores(uint64_t mask) { ps4_new_thread_cores = mask & 0x7F; }
 void ps4_kit_set_min_thread_stack(size_t bytes) { g_minThreadStack = bytes; }
 void ps4_kit_set_boost_priority(int priority) { g_boostPriority = clampInt(priority, 256, 767); }
+void ps4_kit_set_new_thread_priority(int priority) { ps4_new_thread_priority = priority ? clampInt(priority, 256, 767) : 0; }
+void ps4_kit_set_thread_priority(int priority) { ps4k_scePthreadSetprio(ps4k_scePthreadSelf(), clampInt(priority, 256, 767)); }
+int ps4_kit_thread_priority(void) {
+    int priority = 0;
+    return ps4k_scePthreadGetprio(ps4k_scePthreadSelf(), &priority) ? -1 : priority;
+}
 
 // The busiest threads that never spin on another thread's locks (RADV's GPU submission thread, the
 // sceGnmSubmitCommandBuffers calls at ~0.4 ms each; emulated CPU cores; an NVN replay thread) above

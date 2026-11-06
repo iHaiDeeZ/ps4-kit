@@ -173,6 +173,14 @@ void ps4_kit_set_min_thread_stack(size_t bytes);
 // for threads that never spin on another thread's locks (GPU submission, emulated CPUs).
 void ps4_boost_thread(void);
 void ps4_kit_set_boost_priority(int priority);  // default 650 (audio stays higher at 400)
+// The priority pthread_create gives new threads (256 highest .. 767 lowest; 0, the default: the
+// system's, inherited from the creator). The PS4 gives threads of one priority no turns: a busy one
+// keeps its core, so a process whose threads must win over another's (or yield to them) sets it.
+extern int ps4_new_thread_priority;
+void ps4_kit_set_new_thread_priority(int priority);
+// The calling thread's priority (256 .. 767), set and read (-1: not read).
+void ps4_kit_set_thread_priority(int priority);
+int ps4_kit_thread_priority(void);
 // Every kit-started thread's outermost app frame: a backtrace may stop here (unwinding further
 // steps into system code the eboot's unwind tables don't cover).
 void* ps4_thread_entry(void* raw);
