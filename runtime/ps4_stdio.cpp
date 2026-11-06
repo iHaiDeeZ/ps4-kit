@@ -30,14 +30,24 @@ void init() {
     pthread_mutexattr_destroy(a);
 }
 
+// How deep the thread is in the lock (asking for it counts): for thread dumps, read on the thread
+// itself from a signal handler (ps4_stdio_depth)
+__attribute__((tls_model("initial-exec"))) thread_local int t_depth = 0;
+
 struct Hold {
     Hold() {
+        t_depth++;
         pthread_once(&g_once, init);
         pthread_mutex_lock(&g_stdio);
     }
-    ~Hold() { pthread_mutex_unlock(&g_stdio); }
+    ~Hold() {
+        pthread_mutex_unlock(&g_stdio);
+        t_depth--;
+    }
 };
 } // namespace
+
+extern "C" int ps4_stdio_depth(void) { return t_depth; }
 
 extern "C" {
 int __real_vfprintf(FILE* f, const char* fmt, va_list ap);

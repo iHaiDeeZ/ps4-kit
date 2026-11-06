@@ -129,6 +129,11 @@ size_t ps4_heap_footprint(void);           // the same, main heap plus the overf
 void ps4rt_heap_report(char* out, size_t size);
 // MiB in use in all heaps (within ~1 MiB per thread); *overflow_heaps (may be NULL): mapped now.
 size_t ps4_heap_in_use_mib(int* overflow_heaps);
+// How deep the calling thread is in the heap's functions, and in the one stdio lock (ps4_stdio.cpp),
+// waiting for its lock or holding it: 0 outside. Thread-local, safe in a signal handler on the thread
+// (a thread dump's: which thread was inside when everything stood still).
+int ps4_heap_depth(void);
+int ps4_stdio_depth(void);
 // Call every ~5 s (a monitor thread): overflow heaps empty for two calls give their direct memory
 // back; every 12th call also writes the heap profile when it is on.
 void ps4_heap_trim(void);

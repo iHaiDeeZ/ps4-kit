@@ -1292,7 +1292,19 @@ void ps4_heap_error(void* msp, void* chunk, int corruption) {
         abort();
 }
 
+// How deep the thread is in the heap's functions (waiting for a lock counts): for thread dumps,
+// read on the thread itself from a signal handler (ps4_heap_depth). Freezes where every thread that
+// allocates stood still (WinePS4 v00.63) need to know which was inside.
+__attribute__((tls_model("initial-exec"))) thread_local int t_heapDepth = 0;
+struct HeapDepth {
+    HeapDepth() { t_heapDepth++; }
+    ~HeapDepth() { t_heapDepth--; }
+};
+
+int ps4_heap_depth(void) { return t_heapDepth; }
+
 void* __wrap_malloc(size_t size) {
+    HeapDepth depth;
     t_op = "malloc";
     t_caller = __builtin_return_address(0);
     t_want = size;
@@ -1307,6 +1319,7 @@ void* __wrap_malloc(size_t size) {
 void __wrap_free(void* ptr) {
     if (!ptr)
         return;
+    HeapDepth depth;
     t_op = "free";
     t_caller = __builtin_return_address(0);
     checkHeap(t_op, t_caller);
@@ -1321,6 +1334,7 @@ void __wrap_free(void* ptr) {
 }
 
 void* __wrap_calloc(size_t nelem, size_t size) {
+    HeapDepth depth;
     t_op = "calloc";
     t_caller = __builtin_return_address(0);
     t_want = nelem * size;
@@ -1333,6 +1347,7 @@ void* __wrap_calloc(size_t nelem, size_t size) {
 }
 
 void* __wrap_realloc(void* ptr, size_t size) {
+    HeapDepth depth;
     t_op = "realloc";
     t_caller = __builtin_return_address(0);
     t_want = size;
@@ -1374,6 +1389,7 @@ void* __wrap_realloc(void* ptr, size_t size) {
 }
 
 void* __wrap_memalign(size_t alignment, size_t size) {
+    HeapDepth depth;
     t_op = "memalign";
     t_caller = __builtin_return_address(0);
     t_want = size + alignment;
