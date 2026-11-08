@@ -27,16 +27,26 @@ export PS4_CXX_FLAGS="-nostdinc++ -isystem $PS4_SYSROOT/include/c++/v1"
 export JOBS="${JOBS:-$(nproc)}"
 
 # PacBrew's ld.lld links against libxml2.so.2; newer distros only ship libxml2.so.16 (same C API), so
-# give it a private compat link if needed (from love-ps4's build.sh).
-if [ -x "$OPENORBIS/bin/ld.lld" ] && ldd "$OPENORBIS/bin/ld.lld" 2>/dev/null | grep -q "libxml2.so.2 => not found"; then
-    _compat=$(ls /usr/lib/x86_64-linux-gnu/libxml2.so.* 2>/dev/null | grep -E 'libxml2\.so\.[0-9]+$' | head -1)
+# give it a private compat link if needed (from love-ps4's build.sh). The link is shared by every build
+# on the machine: it is made only when it is missing or points elsewhere, and then by a rename, never
+# removed first. A plain `ln -sf` in each script that sources this left an instant without it, and a
+# CMake configure in another build loading ld.lld then failed its compiler check ("libxml2.so.2: cannot
+# open shared object file", MP3 v00.51's first Xenos test build, 2026-11-08).
+if [ -x "$OPENORBIS/bin/ld.lld" ] && [[ "$(ldd "$OPENORBIS/bin/ld.lld" 2>/dev/null)" == *"libxml2.so.2 => not found"* ]]; then
+    _compat=""
+    for _lib in /usr/lib/x86_64-linux-gnu/libxml2.so.[0-9]*; do
+        if [[ "$_lib" =~ /libxml2\.so\.[0-9]+$ ]]; then _compat="$_lib"; break; fi
+    done
     if [ -n "$_compat" ]; then
         mkdir -p "$PSB/host-compat"
-        ln -sf "$_compat" "$PSB/host-compat/libxml2.so.2"
+        if [ "$(readlink "$PSB/host-compat/libxml2.so.2" 2>/dev/null)" != "$_compat" ]; then
+            ln -sfn "$_compat" "$PSB/host-compat/.libxml2.so.2.$$"
+            mv -fT "$PSB/host-compat/.libxml2.so.2.$$" "$PSB/host-compat/libxml2.so.2"
+        fi
         case ":${LD_LIBRARY_PATH:-}:" in *":$PSB/host-compat:"*) ;; *)
             export LD_LIBRARY_PATH="$PSB/host-compat${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;; esac
     fi
-    unset _compat
+    unset _compat _lib
 fi
 
 need() {
