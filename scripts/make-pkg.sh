@@ -37,6 +37,15 @@ if [ -z "${PKGTOOL:-}" ]; then
         PKGTOOL="$PSB/tools/pkgtool-fixed/PkgTool.Core"
     fi
 fi
+# The toolchain's PkgTool stops past ~4 GB: say so before building rather than after (a package with a
+# game's data in it, such as MP3's one-file package, is 8 GB).
+if [ "$PKGTOOL" = "$TOOLS/PkgTool.Core" ]; then
+    stage_mb=$(( $(du -sb "$STAGE" | cut -f1) / 1048576 ))
+    if [ "$stage_mb" -gt 3500 ]; then
+        echo "the stage holds $stage_mb MB: packages past ~4 GB need the PkgTool scripts/build-pkgtool.sh makes" >&2
+        exit 1
+    fi
+fi
 read -r -a PKGTOOL <<< "$PKGTOOL"
 STYLE="${SFO_STYLE:-plain}"
 
