@@ -258,9 +258,13 @@ void writeThread(FILE* f, Slot& s, uint32_t rounds) {
     fprintf(f, "thread %d \"%s\": %u samples of %u rounds, %.1f%% busy\n", s.tid, s.name, n, rounds,
             100.0 * (n - waiting) / n);
     char where[96], from[300];
-    for (uint32_t i = 0; i < unique && i < 400; i++) {
-        if (g_entries[i].count < 2 && i >= 40)
-            break;
+    for (uint32_t i = 0; i < unique; i++) {
+        // Every running sample's stack (2026-11-08, MP3 v00.49: a busy thread's running samples are mostly stacks
+        // seen once, the leaf's address differing, and the cut below left its profile with little but its
+        // waits); the waiting ones as before: the 40 most frequent, then those seen twice or more, up to 400.
+        const bool waiting_entry = (g_entries[i].rip & kWaitingTag) != 0;
+        if (waiting_entry && (i >= 400 || (g_entries[i].count < 2 && i >= 40)))
+            continue;
         describe(g_entries[i].rip & ~kWaitingTag, where, sizeof(where));
         size_t len = 0;
         from[0] = 0;
