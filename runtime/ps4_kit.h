@@ -195,6 +195,9 @@ void ps4_kit_set_count_clock_reads(int on);
 // detached thread), and what the TSC, clocks, a yield, atomics and float conversions cost.
 void ps4_tsc_probe(void);
 void ps4_timer_bench(char* out, size_t size);
+// The cores' clock in MHz, measured on the first call (~10 ms) and kept: ~1600 on a PS4, ~2130 on a
+// PS4 Pro running the app in Boost Mode (Settings > System).
+unsigned ps4_kit_cpu_mhz(void);
 
 // --- Ending the app ----------------------------------------------------------------------------
 //

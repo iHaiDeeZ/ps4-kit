@@ -54,12 +54,14 @@ namespace {
 constexpr int kSigProfile = 26;  // SIGVTALRM (FreeBSD): SIGPROF is the 1 kHz sampler's
 constexpr int kSaOnstack = 0x0001, kSaRestart = 0x0002, kSaSiginfo = 0x0040;
 constexpr uint64_t kWaitingTag = 1ULL << 63;
-constexpr int kSlots = 128, kRing = 2048, kCallers = 4;  // threads alive at once; samples a thread per profile
+// kCallers 12 (was 4; MP3 v00.60, 2026-11-13): with 4, a recompiled game's deep call chains showed only their leaves'
+// neighbours and every higher function's total was cut short (a busy main thread looked flat). 208 KiB a ring.
+constexpr int kSlots = 128, kRing = 2048, kCallers = 12;  // threads alive at once; samples a thread per profile
 constexpr long kPeriodNs = 4000000;                      // a round every 4 ms
 
 enum : uint32_t { kFree, kAlive, kEnded };  // kEnded: the thread is gone, its samples not yet written
 
-// A slot's samples: allocated when its thread is first sampled (80 KiB; SSBU kept 10 MiB of these
+// A slot's samples: allocated when its thread is first sampled (208 KiB; SSBU kept 10 MiB of these
 // for 128 slots whether it ever profiled or not), kept for the slot's later threads.
 struct Ring {
     uint64_t samples[kRing];
@@ -107,7 +109,8 @@ void onProfile(int, siginfo_t*, void* context) {
     // clock so often). Found by scanning, so now and then a stale one.
     const uintptr_t rsp = regs[kRspIndex];
     const uintptr_t limit = std::min<uintptr_t>(
-        rsp < s.stack_top && s.stack_top - rsp < (64u << 20) ? s.stack_top : (rsp | 0x3FFF) + 1, rsp + 16384);
+        rsp < s.stack_top && s.stack_top - rsp < (64u << 20) ? s.stack_top : (rsp | 0x3FFF) + 1,
+        rsp + (rsp < s.stack_top ? 65536 : 16384));  // a known stack: 64 KiB, for the deeper callers
     for (uintptr_t at = rsp & ~7ull; at + 8 <= limit && ncallers < kCallers; at += 8) {
         const uint64_t v = *reinterpret_cast<const uint64_t*>(at);
         if (isReturnAddress(v))
@@ -257,7 +260,7 @@ void writeThread(FILE* f, Slot& s, uint32_t rounds) {
     std::sort(g_entries, g_entries + unique, [](const Entry& a, const Entry& b) { return a.count > b.count; });
     fprintf(f, "thread %d \"%s\": %u samples of %u rounds, %.1f%% busy\n", s.tid, s.name, n, rounds,
             100.0 * (n - waiting) / n);
-    char where[96], from[300];
+    char where[96], from[640];
     for (uint32_t i = 0; i < unique; i++) {
         // Every running sample's stack (2026-11-08, MP3 v00.49: a busy thread's running samples are mostly stacks
         // seen once, the leaf's address differing, and the cut below left its profile with little but its

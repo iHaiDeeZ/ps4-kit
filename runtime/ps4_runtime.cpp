@@ -2309,6 +2309,44 @@ void ps4_tsc_probe(void) {
     }).detach();
 }
 
+// The cores' clock, measured once: chains of dependent register additions, one cycle each (its two
+// integer pipes keep the loop's own count and branch beside the chain on the Jaguar; additions of
+// a constant are not used, as newer x86 cores fold those away when renaming), timed with
+// CLOCK_MONOTONIC, the shortest of seven runs of ~1.3 ms. The TSC runs at its own fixed rate
+// whatever the cores do, so it cannot say this (MP3 v00.52: does a PS4 Pro's Boost Mode reach a
+// homebrew app?).
+unsigned ps4_kit_cpu_mhz(void) {
+    static std::atomic<unsigned> s_mhz{0};
+    if (const unsigned mhz = s_mhz.load(std::memory_order_relaxed))
+        return mhz;
+    constexpr int kLoops = 1 << 16;  // x 32 additions
+    double best = 1e30;
+    for (int run = 0; run < 7; run++) {
+        uint64_t x = 0;
+        const uint64_t one = 1;
+        timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int i = 0; i < kLoops; i++) {
+            __asm__ volatile(
+                "add %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\t"
+                "add %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\t"
+                "add %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\t"
+                "add %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\t"
+                "add %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\tadd %1, %0\n\t"
+                "add %1, %0\n\tadd %1, %0"
+                : "+r"(x)
+                : "r"(one));
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const double ns = (double)(t1.tv_sec - t0.tv_sec) * 1e9 + (double)(t1.tv_nsec - t0.tv_nsec);
+        if (ns > 0 && ns < best)
+            best = ns;
+    }
+    const unsigned mhz = (unsigned)((double)kLoops * 32.0 / best * 1000.0 + 0.5);
+    s_mhz.store(mhz, std::memory_order_relaxed);
+    return mhz;
+}
+
 // What the time stamp counter, the clocks, a yield, atomics and float conversions cost on this
 // console, in ns per call. Measured on a base PS4, 2026-10-21 (Crema): rdtsc 27.7, clock_gettime
 // 50, kernel clock 777, sched_yield 8755, lock xadd 10, mutex 60, mulsd 2.6, CVTSD2SS+CVTSS2SD 9.5,
