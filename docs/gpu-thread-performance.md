@@ -83,6 +83,32 @@ Now: 4096 entries, and each removal clears only the entries of the removed range
 for a range was set for an address inside it). Every removal must go through that one helper, or a
 stale pointer is used after its object is deleted.
 
+## Games that change state on nearly every draw (measured, Donkey Kong Country: Tropical Freeze)
+
+DKC: Tropical Freeze, Crema Lab 109ee892, 2026-11-14: 60 FPS, about 20,000 draws a second, but
+104,252 draws in 85,675 "runs" (a run = draws without state changes between them; BotW has 3.5 draws
+per run). Nearly every draw takes the full setup path, so a draw costs the render thread 13 µs,
+twice BotW's 6.2. The render thread still had 43-54% idle time; the busiest emulated core ran ~80%.
+Optimizing the per-run path (not only the draw-to-draw fast path) is what games like this need.
+
+Its profile (render thread busy time): the largest single cost was processing the game's data-cache
+flush queue, 4.7% of all samples (about 11% of the busy time). Every flushed 1 KiB page walked
+the interval tree on its own, and games flush whole buffers at once. Now the pages are sorted and
+merged into runs, with one tree query per run. That's exactly equivalent, because invalidation only
+widens a page-aligned range (Crema Lab 009b9fa9, not measured yet).
+
+## A direct-access buffer path and why it waits
+
+Upstream Cemu has a mode where the Wii U memory is imported as one Vulkan buffer
+(VK_EXT_external_memory_host) and draws read vertex and uniform data from it directly, with no
+buffer cache. On the PS4 the guest memory is already direct memory (WB onion) and GPU addresses
+are CPU addresses. The kit's `ac_drm_create_bo_from_user_mem` returns ENOSYS although RADV
+advertises the extension (has_userptr). It could be made to work: map the pages GPU-readable and
+use the pointer as the GPU address. The blocker is correctness, not the PS4: GPU retirement
+timestamps (EVENT_WRITE_EOP) are written when the render thread parses them, not when the PS4 GPU
+has finished. A game would overwrite buffers the GPU hasn't read yet. Timestamps would have to wait
+for the PS4 GPU's fences first. Upstream left the mode commented out.
+
 ## How these were found
 
 - The kit's sampler, per thread, with the release ELF kept for every build: `llvm-symbolizer-21`
