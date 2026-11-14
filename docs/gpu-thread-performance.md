@@ -136,10 +136,30 @@ prologue and epilogue. In the generated code an HLE call is always followed by a
 jump table to a segment that loads its registers from the CPU state, so nothing needs the XMM
 registers kept. Crema now calls a SysV entry there (arguments in RDI/RSI); R14, which holds the
 stack pointer across the call, is callee-saved in both conventions (Crema Lab v03.34, md5
-f7bd85c7). Helpers called in the middle of generated code (mftb's `PPCRecompiler_GetTBL/GetTBU`)
+f7bd85c7). Measured, BotW open world with the profiler on: the HLE entry went from 6.2% to
+3.2% of the main core (2.2% from 3.6% on core 2), and core 2's scheduler-lock spin from 5.8% to
+2.0% after the lockless yield look. Helpers called in the middle of generated code (mftb's `PPCRecompiler_GetTBL/GetTBU`)
 still pay this cost: there the register allocator may rely on XMM6-15 surviving, so changing them
 needs the allocator's call-clobber list changed too. Any port with a JIT that calls MS-ABI helpers
 from SysV code pays the same toll.
+
+## CALL/RET pairing for a JIT's out-of-line returns (built, not measured yet)
+
+Crema's recompiler (Guest Returns: Predicted) turns guest calls into host CALLs and guest
+returns into RETs, so the CPU's return stack buffer predicts them. A guest call into an OS
+import stub is a CALL too, but the stub left through an indirect JMP via the jump table, so its
+return-stack entry was never popped. Every OS call (hundreds of thousands a second) left the
+predictor one entry off, and the returns after it mispredicted. Now the stub leaves like a guest
+`blr`: next guest address in EDX, then RET. Return sites check EDX against their own address, so
+a RET that finds a frame the guest isn't returning to falls through to the jump table (Crema Lab
+v03.35, md5 55881e70). Any JIT that maps guest calls to host CALLs must leave every called
+routine by RET, or it desynchronizes the return predictor.
+
+## Profiling cost (measured)
+
+Timing every OS call (two rdtsc around each, ~300k calls a second) cost BotW's main core ~11% of
+its samples, so profiled runs were slower than normal play. Now a function's first 64 calls in a
+report window are timed, then one in 16, which counts for 16 (Crema Lab v03.35).
 
 ## How these were found
 
