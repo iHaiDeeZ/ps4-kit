@@ -56,7 +56,12 @@ waits, command pool calls, every destroy/free, and rare commands with `pNext` ch
   - while it's on, every 90 s a trial with it off checks it still helps.
   Turning off = wait for the ring to drain, then make calls directly again (the hooks pass through
   when the thread-local flag is off). A port at 60 FPS has render-thread idle time, so it never
-  triggers. Auto's console result is not measured yet (Crema Lab 109ee892 and later).
+  triggers. Measured (BotW open world, Crema Lab 109ee892, 2026-11-14): with the driver thread on, the render
+  thread went to 2.9 µs a draw and 40% idle, but the game stayed at 21.5-22.5 FPS; off, it was 22.7
+  FPS at 6.2 µs and 1% idle. Auto's 90-second check turned it off, and a later trial lost 6% and was
+  dropped. Later the render thread had 11-14% idle time with it off: the emulated CPU (main thread
+  running 87%, its core 2 at 100%) was the limit. Freeing the render thread shows in FPS only where
+  it alone is the limit; Auto's on/off trials are what find out.
 
 ## Data another core just wrote (not measured yet)
 
