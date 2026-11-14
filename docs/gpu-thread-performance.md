@@ -109,6 +109,22 @@ timestamps (EVENT_WRITE_EOP) are written when the render thread parses them, not
 has finished. A game would overwrite buffers the GPU hasn't read yet. Timestamps would have to wait
 for the PS4 GPU's fences first. Upstream left the mode commented out.
 
+## The emulated CPU side (measured BotW, Crema Lab 009b9fa9)
+
+Open world at 23.8-24.0 FPS; the game's main thread ran 87%, emulated core 2 was pinned at 100%.
+On core 2's host thread: translated game code 70%, HLE dispatch ~6%, and 4.9% spinning in the
+scheduler lock's `pause` loop, waiting for another core to release it. The lock is a single
+global spin lock taken by every guest thread switch, event, message, mutex, and by every
+OSYieldThread's look at its core's run queue. BotW's spin loops yield tens of thousands of times a
+second. Now the yield looks at the run queue without the lock first (guest memory is never freed,
+so a racy read is safe; a stale answer costs one yield), with the locked look kept as the fallback
+for an implausibly long walk (Crema Lab dda7e4e5, not measured yet). General lesson: on Jaguar a
+global lock that many cores take at high rates costs more in waiting than in the lock itself;
+take reads that only decide a hint out from under it.
+
+Profiler caveat: with the profiler on, every HLE call goes through a timed path (10-17% of a core
+in `PPCInterpreter_callHLETimed`), so HLE costs look larger than in normal play.
+
 ## How these were found
 
 - The kit's sampler, per thread, with the release ELF kept for every build: `llvm-symbolizer-21`
