@@ -125,6 +125,22 @@ take reads that only decide a hint out from under it.
 Profiler caveat: with the profiler on, every HLE call goes through a timed path (10-17% of a core
 in `PPCInterpreter_callHLETimed`), so HLE costs look larger than in normal play.
 
+## Calling conventions at the JIT's helper calls (built, not measured yet)
+
+Cemu declares its recompiler helpers `ATTR_MS_ABI` (the Windows x64 convention), so the generated
+code calls them the same way on every OS. Compiled for the PS4 (SysV), such a helper that calls
+ordinary code must save and restore XMM6-XMM15, RSI and RDI itself: 20 vector memory operations
+per call. The HLE entry (`PPCRecompiler_virtualHLE`, every guest OS call: several hundred thousand
+a second on a busy core) showed it: 6.2% of BotW's main core inside that function, mostly the
+prologue and epilogue. In the generated code an HLE call is always followed by a jump through the
+jump table to a segment that loads its registers from the CPU state, so nothing needs the XMM
+registers kept. Crema now calls a SysV entry there (arguments in RDI/RSI); R14, which holds the
+stack pointer across the call, is callee-saved in both conventions (Crema Lab v03.34, md5
+f7bd85c7). Helpers called in the middle of generated code (mftb's `PPCRecompiler_GetTBL/GetTBU`)
+still pay this cost: there the register allocator may rely on XMM6-15 surviving, so changing them
+needs the allocator's call-clobber list changed too. Any port with a JIT that calls MS-ABI helpers
+from SysV code pays the same toll.
+
 ## How these were found
 
 - The kit's sampler, per thread, with the release ELF kept for every build: `llvm-symbolizer-21`
