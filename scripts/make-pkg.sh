@@ -86,7 +86,11 @@ plain)
     # 0x2: system dialogs (the keyboard) confirm with Cross. Without it they follow the console's
     # region default, which is Circle on some consoles (DolphinPS4 Lab's fix). SFO_ATTRIBUTE replaces
     # it, e.g. 0x800002 adds 0x800000, "supports NEO mode": a PS4 Pro runs the app at its own clocks
-    # (CPU 2.13 GHz instead of 1.6) without Boost Mode.
+    # (CPU 2.13 GHz instead of 1.6) without Boost Mode. But NEO mode also hands the app the Pro's own
+    # GPU (36 compute units), which the kit's RADV doesn't describe (it knows the PS4's Liverpool),
+    # and the CPU gets no more than Boost Mode (PS4 Settings > System) gives an app without the flag:
+    # DolphinPS4 froze in Mario Kart with it, so Dolphin and Crema ship without it and tell Pro owners
+    # to turn Boost Mode on instead (Crema v03.44: sceKernelHasNeoMode + ps4_kit_cpu_mhz-style clock).
     set_entry ATTRIBUTE Integer 4 "${SFO_ATTRIBUTE:-0x2}"
     set_entry CATEGORY Utf8 4 gd
     set_entry SYSTEM_VER Integer 4 0 ;;
