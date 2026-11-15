@@ -62,6 +62,11 @@ waits, command pool calls, every destroy/free, and rare commands with `pNext` ch
   dropped. Later the render thread had 11-14% idle time with it off: the emulated CPU (main thread
   running 87%, its core 2 at 100%) was the limit. Freeing the render thread shows in FPS only where
   it alone is the limit; Auto's on/off trials are what find out.
+- Crema Lab v03.35 (2026-11-15, BotW open world, 30 minutes): Auto turned it on after the first
+  busy stretch and every 90-second check kept it: 25.7-26.8 FPS with it, 23.0-24.4 without, the
+  render thread at 3.1 µs a draw and 33-35% idle. Same game, same setting, a different answer than
+  on 11-14: the CPU-side fixes in between moved the limit. A fixed on/off choice would have been
+  wrong one of the two days.
 
 ## Data another core just wrote (not measured yet)
 
@@ -155,11 +160,62 @@ a RET that finds a frame the guest isn't returning to falls through to the jump 
 v03.35, md5 55881e70). Any JIT that maps guest calls to host CALLs must leave every called
 routine by RET, or it desynchronizes the return predictor.
 
+Measured with v03.34's sampling profile and v03.35's first run (2026-11-15, BotW open world,
+profiler on): 25.7-26.4 FPS for 30 minutes against 24.2-24.7 on v03.34. Not isolated: v03.35 also
+cut the profiler's own cost (below), and the driver thread stayed on all run.
+
+## Where an emulated core's time goes: BotW's core 2 (measured, v03.34)
+
+Core 2's host thread: 68.5% recompiled game code, 26% Crema's own code, 5.6% system. The game code
+is spread over 2,127 functions, but four are 16% of the core: the C++ runtime's array construct
+and destruct helpers (a loop calling the element constructor through `bctrl`) and the constructor
+and destructor of an 8-byte object (they set two vtable words). The loop's own overhead was twice
+the constructor's: guest registers stored to the CPU state before each call and loaded after it.
+Next: a byte-compare loop (inlined strcmp). Threads on the core: RadarMgr runs 22% and is ready
+76% of the time, the other 15 threads share the rest; yields that find no other thread already
+return at once (v03.34), so this is real work.
+
+## Jump encoding on Jaguar: branch relaxation (built, not measured yet)
+
+Upstream Cemu's x86 backend emits every jump between a function's blocks in the 6-byte Jcc (5-byte
+JMP) form and, when the target turns out to be near, rewrites it as a 2-byte Jcc followed by a
+4-byte NOP. That's the same size, plus one more instruction to decode on the fall-through path, and
+Jaguar decodes two per cycle. Crema now generates a function twice: pass 1 as before, and pass 2
+emits the jumps that reached within a byte in pass 1 in the true 2-byte form (JMP too, which upstream
+never shortened). Pass 2 only removes bytes, and a jump's displacement spans only the code between
+it and its target, so every such jump still reaches. A check falls back to pass 1 if one doesn't.
+Also: where a block's cycle-count `SUB R12D, n` comes right before its cycle check in the same block,
+the check is `JS` on the SUB's flags instead of `BT R12D, 31` + `JC` (jumps only land at block
+starts). BotW, 71,962 functions: 97.50 MB of x86 code -> 96.05 MB (-1.5%), compile time unchanged
+(code generation is a small part of it). A tight byte loop went from 15 to 13 instructions per
+iteration. PC tests: random programs and 3,000 chained runs of BotW's real functions, results
+identical with it on and off (Crema Lab v03.36, md5 48f5a9f6).
+
+## Register write-backs inside loops (built, not measured yet)
+
+Cemu's register allocator keeps a guest register in a host register across blocks and stores it
+back only where the value leaves its live range. It moves that store from the write to the range's
+endings (out of a loop) only if it can account for every successor block. A successor without a
+range for the register counted as unknown, so the store stayed at the write, inside the loop. In
+BotW's strcmp loop that was a store on every iteration because the value is live after the loop
+and flows into code with exits. Two changes:
+- A successor that overwrites the register before any read, call or exit needs no value: skipped.
+- Any other successor without a range gets the store at the end of the range piece before it, the
+  same place the allocator already stores a range that goes on. With such stores the move is made
+  only when it is cheaper (out of a deeper loop); at the same depth every path still stores once,
+  and the code would only grow.
+The loop: 12 instructions per iteration, from 15 before both changes. BotW code +0.14%, from stores
+duplicated at several exits. PC tests: random programs in six modes (extra entry points, cut-off
+code, 8 registers) identical. Chained BotW runs (two seeds, 14,000 runs): the 7,663 that completed
+are identical; 80 that faulted midway differ only in register values not yet stored at the fault,
+with the same memory writes (Crema Lab v03.36, md5 48f5a9f6).
+
 ## Profiling cost (measured)
 
 Timing every OS call (two rdtsc around each, ~300k calls a second) cost BotW's main core ~11% of
 its samples, so profiled runs were slower than normal play. Now a function's first 64 calls in a
-report window are timed, then one in 16, which counts for 16 (Crema Lab v03.35).
+report window are timed, then one in 16, which counts for 16 (Crema Lab v03.35). The v03.34 sample
+addresses showed it: 11% of core 1 in the 16-byte buckets around the two `rdtsc`.
 
 ## How these were found
 
@@ -171,3 +227,7 @@ report window are timed, then one in 16, which counts for 16 (Crema Lab v03.35).
   split per draw, which the sampler can't (inlining).
 - Timing logs streamed to the PC (Crema Lab Link) give fps, render-thread idle %, and per-stage costs
   for every run without asking for log files.
+- JIT samples carry the guest function and the x86 offset in it. The recompiler built for the PC
+  (Crema's tests/jittest) compiles the same game function from the game's code and writes its x86,
+  so a hot offset can be read as an instruction. It also gives the code bytes per intermediate
+  instruction kind over a whole game, which shows where a code-generation change pays.
