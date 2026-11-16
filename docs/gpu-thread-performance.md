@@ -210,6 +210,36 @@ code, 8 registers) identical. Chained BotW runs (two seeds, 14,000 runs): the 7,
 are identical; 80 that faulted midway differ only in register values not yet stored at the fault,
 with the same memory writes (Crema Lab v03.36, md5 48f5a9f6).
 
+## What a JIT's hot code is made of (measured, BotW on a PS4 Pro, Crema Lab v03.48)
+
+The profiler dumps the console's own x86 for the 60 busiest recompiled functions with their sample
+counts (`hotfuncs.bin`). Disassembled with capstone, sample-weighted:
+- 35% loads and stores of the emulated register file (20% stores, 15.5% loads), spread over many
+  guest registers: r3, LR, r0, cr0 bytes and r1 lead, each under 4% of all instructions;
+- 14% register moves, 7.7% the cycle counter's per-block subtraction;
+- about 26% the guest program's actual arithmetic, compares and memory accesses;
+- floating point only ~2% (single-precision rounding 1.5%), although BotW is a 3D game.
+Jaguar issues two instructions a cycle, so the overhead costs time. It comes mostly from calls and
+returns (arguments, LR, prologue helpers), so no one register is worth pinning in a host register.
+
+## Native versions of hot guest library routines (built and PC-tested, v03.49)
+
+The same profile's hottest functions included library routines the game links in as PowerPC code:
+GHS's 64-bit unsigned division (90% of its samples in a 64-step shift-and-subtract loop that x86 does
+in one `div`) and Nintendo sead's string CRC32 (a byte per loop). They run on the world and worker
+threads' cores, not the main thread. Crema recognizes them when the game has loaded and been patched,
+by a fingerprint (FNV-1a 64 over the instruction words, with the game-specific addresses masked out;
+no game code in the source), and puts an HLE call at their first instruction. Rules that kept it exact:
+- the native code changes only what the PowerPC routine also changes (GHS callers keep values in
+  registers across calls whose register use the compiler knows);
+- cases it doesn't take (a zero divisor, a hash table not built yet) are handed back: it performs
+  the routine's first instruction itself and continues at the second;
+- the HLE call sees the routine's own address in the instruction pointer (interpreter and JIT), so one
+  handler serves every copy.
+PC test (Crema's tests/nativetest): the game's routine in the interpreter against the HLE path, 4
+million cases per routine, plus the game's own caller of the hash: identical. Ninja Gaiden 3 links
+the same division routine; the fingerprint found it there too.
+
 ## Profiling cost (measured)
 
 Timing every OS call (two rdtsc around each, ~300k calls a second) cost BotW's main core ~11% of
