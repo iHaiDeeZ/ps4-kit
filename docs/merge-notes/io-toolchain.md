@@ -53,6 +53,10 @@ Conker and Vita3K copies were identical (md5 85c4cb73). Kit changes:
 
 **Link order requirement** (unchanged, but now load-bearing for more functions): `stat`, `lstat`, `access`, `mkdir`, `rename`, `unlink`, `rmdir`, `chmod`, `utimes`, `chdir`, `open`, `close`, `_fstatfs` must bind to **libkernel** (`-lkernel` before `-lc`, as ps4.cmake and bin/ps4-cc do). libc.a's `lstat` is musl's, which calls `fstatat`: with `--wrap=fstatat` that would recurse through `__wrap_fstatat` -> `lstat`. Same for libc's `utime`/`futimesat` -> `utimensat`.
 
+### The ~250 open files limit
+
+The PS4 refuses new files at about 250 open at once (ps4_crashlog.cpp's open()/close() tracking lists what is open and who opened it). A loader that opens a whole set of files up front hits it even though nothing leaks. Crema, 2026-11-16: Cemu opened every content file (`.app`) of a Wii U title in its download form (title.tmd + .app files) at mount time. Breath of the Wild's base (126 files) plus its update (214) went past the limit, so the update failed to mount; the same game unpacked (code/content/meta folders) worked. The fix opens each content file when it is first read and keeps at most 48 per title open, closing the least recently read one (Cemu `FSTDataSourceApp`, under `__ORBIS__`). Any port whose loader opens split archives or per-chunk files all at once needs the same treatment.
+
 ### ps4_modules.cpp: system modules before main
 
 Conker, SSBU, Vita3K identical (md5 5b525086). Kept the five modules (SystemService, UserService, VideoOut, AudioOut, Pad) at constructor priority 102. Generalized:
