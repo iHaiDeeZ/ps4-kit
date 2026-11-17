@@ -1,7 +1,7 @@
 From 0c64ceb7ebcec8f5984d00ceb10cbb01a2daa407 Mon Sep 17 00:00:00 2001
 From: ShiroKlein <ihaideezi@gmail.com>
 Date: Mon, 19 Oct 2026 07:01:37 +0300
-Subject: [PATCH 19/31] PS4: GS ring probe - read VGT_ESGS/GSVS_RING_SIZE back
+Subject: [PATCH 19/32] PS4: GS ring probe - read VGT_ESGS/GSVS_RING_SIZE back
  around the preamble write
 
 ---

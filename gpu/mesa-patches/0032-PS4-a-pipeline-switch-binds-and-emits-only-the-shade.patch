@@ -1,0 +1,250 @@
+From decf02eb23f96c852505fc3416c2efaf34d3a044 Mon Sep 17 00:00:00 2001
+From: ps4-kit <ps4-kit@localhost>
+Date: Mon, 16 Nov 2026 23:56:36 +0300
+Subject: [PATCH 32/32] PS4: a pipeline switch binds and emits only the shader
+ stages that change (per switch on the PC host build: same shaders 0.115 ->
+ 0.068 us, other fragment shader 0.155 -> 0.120 us)
+
+radv_bind_graphics_pipeline called radv_bind_shader for every stage, kept or
+not: binding the same vertex shader again made the next draw rebuild and
+upload the vertex buffer descriptors and reset the vertex SGPR caches, and
+every switch marked all descriptor sets and push constants dirty. Measured
+on the console by kit-test v00.04: +1.90 us per draw for a switch between
+pipelines with the same shaders, +2.54 us with another fragment shader.
+
+- A stage whose shader the previous pipeline also had is not bound again
+  (except a VS with a prolog, a PS with an epilog, merged shaders compiled
+  separately, task/mesh). When the vertex shader is kept, the vertex buffer
+  descriptors are still marked dirty if the pipeline changed static strides
+  or vertex input (binding the VS used to cover that).
+- Push constants are re-emitted only for the stages that changed, and the
+  descriptor sets are not marked dirty when every shader stays.
+- radv_emit_graphics_shaders skips the registers of the pre-rasterization
+  stages when they all stay, and the fragment shader's when it stays; the
+  PS inputs are emitted when either side changed.
+- L2 prefetch only for the new VS/PS.
+---
+ src/amd/vulkan/radv_cmd_buffer.c | 124 +++++++++++++++++++++++++++----
+ 1 file changed, 110 insertions(+), 14 deletions(-)
+
+diff --git a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+index 39b2f11..04271d1 100644
+--- a/src/amd/vulkan/radv_cmd_buffer.c
++++ b/src/amd/vulkan/radv_cmd_buffer.c
+@@ -3865,13 +3865,48 @@ gfx103_emit_vrs_state(struct radv_cmd_buffer *cmd_buffer)
+    }
+ }
+ 
++/* PS4: which of the shaders of <emitted> (the pipeline whose registers the GPU has) are still bound: the
++ * pre-rasterization stages as one group (on merged-shader chips their registers are combined), and the
++ * fragment shader. A switch between pipelines that share a vertex shader (an emulator's pipelines often
++ * differ only in the fragment shader) then emits only the fragment shader's registers. */
+ static void
+-radv_emit_graphics_shaders(struct radv_cmd_buffer *cmd_buffer)
++radv_ps4_kept_shaders(const struct radv_cmd_buffer *cmd_buffer, const struct radv_graphics_pipeline *emitted,
++                      bool *pre_rast_kept, bool *ps_kept)
++{
++   const VkShaderStageFlags fs_bit = VK_SHADER_STAGE_FRAGMENT_BIT;
++   const VkShaderStageFlags now = cmd_buffer->state.active_stages & RADV_GRAPHICS_STAGE_BITS;
++   const VkShaderStageFlags then = emitted ? emitted->active_stages & RADV_GRAPHICS_STAGE_BITS : 0;
++
++   *pre_rast_kept = false;
++   *ps_kept = false;
++   if (!emitted)
++      return;
++
++   *ps_kept = (now & fs_bit) == (then & fs_bit) &&
++              emitted->base.shaders[MESA_SHADER_FRAGMENT] == cmd_buffer->state.shaders[MESA_SHADER_FRAGMENT];
++
++   if ((now & ~fs_bit) != (then & ~fs_bit) || (now & VK_SHADER_STAGE_TASK_BIT_EXT) ||
++       emitted->base.gs_copy_shader != cmd_buffer->state.gs_copy_shader)
++      return;
++   radv_foreach_stage (s, now & ~fs_bit) {
++      if (emitted->base.shaders[s] != cmd_buffer->state.shaders[s])
++         return;
++   }
++   *pre_rast_kept = true;
++}
++
++static void
++radv_emit_graphics_shaders(struct radv_cmd_buffer *cmd_buffer, const struct radv_graphics_pipeline *emitted)
+ {
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+    const struct radv_physical_device *pdev = radv_device_physical(device);
++   bool pre_rast_kept, ps_kept;
++
++   radv_ps4_kept_shaders(cmd_buffer, emitted, &pre_rast_kept, &ps_kept);
+ 
+    radv_foreach_stage (s, cmd_buffer->state.active_stages & RADV_GRAPHICS_STAGE_BITS) {
++      if (pre_rast_kept && s != MESA_SHADER_FRAGMENT)
++         continue;
+       switch (s) {
+       case MESA_SHADER_VERTEX:
+          radv_emit_vertex_shader(cmd_buffer);
+@@ -3886,8 +3921,11 @@ radv_emit_graphics_shaders(struct radv_cmd_buffer *cmd_buffer)
+          radv_emit_geometry_shader(cmd_buffer);
+          break;
+       case MESA_SHADER_FRAGMENT:
+-         radv_emit_fragment_shader(cmd_buffer);
+-         radv_emit_ps_inputs(cmd_buffer);
++         if (!ps_kept)
++            radv_emit_fragment_shader(cmd_buffer);
++         /* The PS input mapping depends on the last pre-rasterization stage's outputs too. */
++         if (!ps_kept || !pre_rast_kept)
++            radv_emit_ps_inputs(cmd_buffer);
+          break;
+       case MESA_SHADER_MESH:
+          radv_emit_mesh_shader(cmd_buffer);
+@@ -3961,7 +3999,7 @@ radv_emit_graphics_pipeline(struct radv_cmd_buffer *cmd_buffer)
+     * buffer, shader objects; meta operations bind pipelines of their own.) */
+    const struct radv_graphics_pipeline *emitted = cmd_buffer->state.emitted_graphics_pipeline;
+    if (!emitted || !radv_ps4_same_graphics_shaders(emitted, pipeline))
+-      radv_emit_graphics_shaders(cmd_buffer);
++      radv_emit_graphics_shaders(cmd_buffer, emitted);
+ 
+    if (pipeline->sqtt_shaders_reloc) {
+       /* Emit shaders relocation because RGP requires them to be contiguous in memory. */
+@@ -8867,7 +8905,32 @@ radv_bind_rt_pipeline(struct radv_cmd_buffer *cmd_buffer, struct radv_ray_tracin
+       cmd_buffer->state.rt_stack_size = rt_pipeline->stack_size;
+ }
+ 
+-static ALWAYS_INLINE void
++/* PS4: a stage whose shader the new pipeline keeps needs no radv_bind_shader: everything that sets up comes
++ * from the shader itself (same shader, same result), and binding the vertex shader again made the draw rebuild
++ * and upload the vertex buffer descriptors and reset the vertex SGPR caches. Shaders whose setup depends on
++ * more than themselves (a VS prolog, a PS epilog, merged shaders compiled separately, task/mesh) are always
++ * bound again. */
++static bool
++radv_ps4_rebind_skippable(const struct radv_shader *shader, mesa_shader_stage stage)
++{
++   if (shader->info.merged_shader_compiled_separately)
++      return false;
++   switch (stage) {
++   case MESA_SHADER_VERTEX:
++      return !shader->info.vs.has_prolog;
++   case MESA_SHADER_FRAGMENT:
++      return !shader->info.ps.has_epilog;
++   case MESA_SHADER_TESS_CTRL:
++   case MESA_SHADER_TESS_EVAL:
++   case MESA_SHADER_GEOMETRY:
++      return true;
++   default:
++      return false;
++   }
++}
++
++/* Returns the stages whose shaders stayed bound (none when the pipeline was already bound). */
++static ALWAYS_INLINE VkShaderStageFlags
+ radv_bind_graphics_pipeline(struct radv_cmd_buffer *cmd_buffer, struct radv_graphics_pipeline *graphics_pipeline)
+ {
+    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+@@ -8879,26 +8942,50 @@ radv_bind_graphics_pipeline(struct radv_cmd_buffer *cmd_buffer, struct radv_grap
+    radv_bind_dynamic_state(cmd_buffer, &graphics_pipeline->dynamic_state);
+ 
+    if (cmd_buffer->state.graphics_pipeline == graphics_pipeline)
+-      return;
++      return 0;
+ 
+    const struct radv_graphics_pipeline *previous = cmd_buffer->state.graphics_pipeline;
+    const bool same_shaders = previous && radv_ps4_same_graphics_shaders(previous, graphics_pipeline);
++   VkShaderStageFlags kept = 0;
+ 
+    radv_foreach_stage (
+       stage, (cmd_buffer->state.active_stages | graphics_pipeline->active_stages) & RADV_GRAPHICS_STAGE_BITS) {
+-      radv_bind_shader(cmd_buffer, graphics_pipeline->base.shaders[stage], stage);
++      struct radv_shader *shader = graphics_pipeline->base.shaders[stage];
++
++      /* (previous is NULL wherever the bound shaders may no longer be ours: a new command buffer, shader
++       * objects; meta operations bind pipelines of their own.) */
++      if (previous && shader && previous->base.shaders[stage] == shader && cmd_buffer->state.shaders[stage] == shader &&
++          radv_ps4_rebind_skippable(shader, stage)) {
++         kept |= mesa_to_vk_shader_stage(stage);
++         continue;
++      }
++      radv_bind_shader(cmd_buffer, shader, stage);
+    }
+ 
++   /* The vertex buffer descriptors hold the strides, which a pipeline with static strides changes without
++    * dirtying them (radv_cmd_set_vertex_binding_strides): binding the vertex shader used to. */
++   if ((kept & VK_SHADER_STAGE_VERTEX_BIT) &&
++       (cmd_buffer->state.dirty_dynamic & (RADV_DYNAMIC_VERTEX_INPUT_BINDING_STRIDE | RADV_DYNAMIC_VERTEX_INPUT)))
++      cmd_buffer->state.dirty |= RADV_CMD_DIRTY_VERTEX_BUFFER;
++
+    radv_bind_gs_copy_shader(cmd_buffer, graphics_pipeline->base.gs_copy_shader);
+ 
+    cmd_buffer->state.graphics_pipeline = graphics_pipeline;
+ 
+    cmd_buffer->state.dirty |= RADV_CMD_DIRTY_PIPELINE;
+-   cmd_buffer->push_constant_stages |= graphics_pipeline->active_stages;
++   /* A kept stage's push constant SGPRs still hold the values (or the upload pointer) last emitted for its
++    * shader; pending changes stay in push_constant_stages. */
++   cmd_buffer->push_constant_stages |= graphics_pipeline->active_stages & ~kept;
+ 
+-   /* Prefetch all pipeline shaders at first draw time (not again for the same shaders). */
+-   if (!same_shaders)
+-      cmd_buffer->state.prefetch_L2_mask |= RADV_PREFETCH_GFX_SHADERS;
++   /* Prefetch the pipeline's new shaders at first draw time (not the ones it keeps). */
++   if (!same_shaders) {
++      uint32_t prefetch = RADV_PREFETCH_GFX_SHADERS;
++      if (kept & VK_SHADER_STAGE_VERTEX_BIT)
++         prefetch &= ~RADV_PREFETCH_VS;
++      if (kept & VK_SHADER_STAGE_FRAGMENT_BIT)
++         prefetch &= ~RADV_PREFETCH_PS;
++      cmd_buffer->state.prefetch_L2_mask |= prefetch;
++   }
+ 
+    const struct radv_shader *ps = radv_get_shader(graphics_pipeline->base.shaders, MESA_SHADER_FRAGMENT);
+ 
+@@ -8929,6 +9016,8 @@ radv_bind_graphics_pipeline(struct radv_cmd_buffer *cmd_buffer, struct radv_grap
+       if (pdev->info.gfx_level >= GFX11)
+          cmd_buffer->state.dirty |= RADV_CMD_DIRTY_FSR_SURFACE_STATE;
+    }
++
++   return kept;
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -8939,6 +9028,10 @@ radv_CmdBindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipeline
+ 
+    radv_reset_shader_object_state(cmd_buffer, pipelineBindPoint);
+ 
++   /* PS4: the descriptor set pointers are user SGPRs of each stage's shader; when the new graphics pipeline
++    * keeps every shader, the pointers the GPU has are still right (sets bound since are dirty already). */
++   bool descriptors_kept = false;
++
+    switch (pipelineBindPoint) {
+    case VK_PIPELINE_BIND_POINT_COMPUTE: {
+       struct radv_compute_pipeline *compute_pipeline = radv_pipeline_to_compute(pipeline);
+@@ -8952,7 +9045,9 @@ radv_CmdBindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipeline
+    }
+    case VK_PIPELINE_BIND_POINT_GRAPHICS: {
+       struct radv_graphics_pipeline *graphics_pipeline = radv_pipeline_to_graphics(pipeline);
+-      radv_bind_graphics_pipeline(cmd_buffer, graphics_pipeline);
++      const VkShaderStageFlags kept = radv_bind_graphics_pipeline(cmd_buffer, graphics_pipeline);
++      const VkShaderStageFlags stages = graphics_pipeline->active_stages & RADV_GRAPHICS_STAGE_BITS;
++      descriptors_kept = stages && (kept & stages) == stages;
+       break;
+    }
+    default:
+@@ -8967,7 +9062,8 @@ radv_CmdBindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipeline
+    cmd_buffer->descriptors[vk_to_bind_point(pipelineBindPoint)].need_indirect_descriptors =
+       pipeline->need_indirect_descriptors;
+ 
+-   radv_mark_descriptors_dirty(cmd_buffer, pipelineBindPoint);
++   if (!descriptors_kept)
++      radv_mark_descriptors_dirty(cmd_buffer, pipelineBindPoint);
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -12606,7 +12702,7 @@ radv_emit_all_graphics_states(struct radv_cmd_buffer *cmd_buffer, const struct r
+       radv_emit_graphics_pipeline(cmd_buffer);
+       cmd_buffer->state.dirty &= ~RADV_CMD_DIRTY_PIPELINE;
+    } else if (cmd_buffer->state.dirty & RADV_CMD_DIRTY_GRAPHICS_SHADERS) {
+-      radv_emit_graphics_shaders(cmd_buffer);
++      radv_emit_graphics_shaders(cmd_buffer, NULL);
+       cmd_buffer->state.dirty &= ~RADV_CMD_DIRTY_GRAPHICS_SHADERS;
+    }
+ 
+-- 
+2.53.0
+

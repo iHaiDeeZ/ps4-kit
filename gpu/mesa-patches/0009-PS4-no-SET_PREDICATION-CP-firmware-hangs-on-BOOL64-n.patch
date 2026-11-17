@@ -1,7 +1,7 @@
 From 0e21f9934df08f40cd1db2b9e0fe225da995efe8 Mon Sep 17 00:00:00 2001
 From: ShiroKlein <23220202+iHaiDeeZ@users.noreply.github.com>
 Date: Fri, 2 Oct 2026 21:04:22 +0300
-Subject: [PATCH 09/31] PS4: no SET_PREDICATION (CP firmware hangs on BOOL64),
+Subject: [PATCH 09/32] PS4: no SET_PREDICATION (CP firmware hangs on BOOL64),
  no conditional rendering
 
 ---

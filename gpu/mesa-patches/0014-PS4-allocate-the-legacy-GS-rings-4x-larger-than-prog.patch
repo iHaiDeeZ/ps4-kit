@@ -1,7 +1,7 @@
 From 34ff87b30526b5f8b0dd0baa94120f876eb76d34 Mon Sep 17 00:00:00 2001
 From: ShiroKlein <23220202+iHaiDeeZ@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 22:00:35 +0300
-Subject: [PATCH 14/31] PS4: allocate the legacy GS rings 4x larger than
+Subject: [PATCH 14/32] PS4: allocate the legacy GS rings 4x larger than
  programmed (GS writes past the GS->VS ring)
 
 ---
