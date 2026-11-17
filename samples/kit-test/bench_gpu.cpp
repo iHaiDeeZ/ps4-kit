@@ -1,6 +1,10 @@
 // kit-test: RADV on GNM through the kit's presenter. Measures what the ports were bound by: the CPU
 // time the driver spends per draw (TOTK ~70 us and SSBU ~17 us per draw included the emulators' own
 // work; this is the driver alone), the GPU's time per frame, and how evenly frames reach the screen.
+// Besides plain draws and pipeline switches, the draw-cost test times what translation layers (DXVK,
+// the Switch and 360 renderers) do around most draws: viewport/scissor and depth/cull state changes,
+// vertex and index buffer binds, and descriptors (a bound set with a dynamic offset, push
+// descriptors, a set written and bound per draw).
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
@@ -9,12 +13,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
 #include "quad.frag.h"
 #include "quad.vert.h"
 #include "quad2.frag.h"
+#include "quad_ubo.frag.h"
+#include "quad_vb.vert.h"
 
 namespace kittest {
 namespace {
@@ -32,8 +39,9 @@ uint32_t queue_family;
     X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties)             \
     X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkCreateDevice) X(vkGetDeviceProcAddr)            \
     X(vkCreateHeadlessSurfaceEXT) X(vkDestroySurfaceKHR) X(vkGetPhysicalDeviceSurfaceFormatsKHR)    \
-    X(vkGetPhysicalDeviceSurfaceSupportKHR)
-#define VK_DEVICE_FNS(X)                                                                           \
+    X(vkGetPhysicalDeviceSurfaceSupportKHR) X(vkGetPhysicalDeviceMemoryProperties)                   \
+    X(vkEnumerateDeviceExtensionProperties)
+#define VK_DEVICE_FNS(X)                                                                         \
     X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR)         \
     X(vkGetSwapchainImagesKHR) X(vkAcquireNextImageKHR) X(vkQueuePresentKHR) X(vkCreateImageView)   \
     X(vkDestroyImageView) X(vkCreateRenderPass) X(vkDestroyRenderPass) X(vkCreateFramebuffer)       \
@@ -45,7 +53,14 @@ uint32_t queue_family;
     X(vkCmdPushConstants) X(vkCmdDraw) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkQueueSubmit)     \
     X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) X(vkCreateSemaphore)     \
     X(vkDestroySemaphore) X(vkDeviceWaitIdle) X(vkCreateQueryPool) X(vkDestroyQueryPool)           \
-    X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
+    X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) X(vkQueueWaitIdle)      \
+    X(vkCreateBuffer) X(vkGetBufferMemoryRequirements) X(vkAllocateMemory) X(vkBindBufferMemory)    \
+    X(vkMapMemory) X(vkCreateImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory)            \
+    X(vkCreateSampler) X(vkCreateDescriptorSetLayout) X(vkCreateDescriptorPool)                    \
+    X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkResetDescriptorPool)                 \
+    X(vkCmdBindDescriptorSets) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) \
+    X(vkCmdPipelineBarrier) X(vkCmdClearColorImage) X(vkCmdSetCullMode) X(vkCmdSetFrontFace)       \
+    X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp)
 #define DECLARE(fn) PFN_##fn fn;
 VK_FNS(DECLARE)
 VK_DEVICE_FNS(DECLARE)
@@ -56,6 +71,7 @@ struct Frame {
     VkCommandBuffer cmd;
     VkFence fence;
     VkSemaphore acquired, rendered;
+    VkDescriptorPool set_pool;  // the written-per-draw sets, reset each frame
 };
 
 VkSurfaceKHR surface;
@@ -69,6 +85,20 @@ Frame frames[2];
 VkQueryPool queries;
 float timestamp_period_ns;
 bool timestamps_ok;
+
+// The draw-cost test's extra state. One host-visible buffer holds the uniform slots, the vertex
+// copies and the index copies; the texture is 4x4. Each descriptor test has its own set layout (a
+// dynamic uniform buffer, a plain one, a push descriptor one), so its own pipeline layout and pipeline.
+constexpr uint32_t kUboSlots = 256, kVbCopies = 16, kMaxDrawsPerFrame = 10000;
+PFN_vkCmdPushDescriptorSetKHR vkCmdPushDescriptorSetKHR;
+VkBuffer buffer;
+VkDeviceSize ubo_align, vb_offset, ib_offset;
+VkImageView texture_view;
+VkSampler sampler;
+VkPipelineLayout layout_dyn, layout_plain, layout_push;
+VkDescriptorSetLayout set_layout_plain;
+VkDescriptorSet set_dyn;
+VkPipeline pipe_dynstate, pipe_vb, pipe_dyn, pipe_plain, pipe_push;
 
 struct Push {
     float offset[2], size[2], color[4];
@@ -120,16 +150,26 @@ bool create_device() {
     qci.queueFamilyIndex = queue_family;
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
-    const char* dexts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    const char* dexts[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME};
+    uint32_t nexts = 0;
+    vkEnumerateDeviceExtensionProperties(physical, nullptr, &nexts, nullptr);
+    std::vector<VkExtensionProperties> available(nexts);
+    vkEnumerateDeviceExtensionProperties(physical, nullptr, &nexts, available.data());
+    bool push_descriptors = false;
+    for (const VkExtensionProperties& e : available)
+        push_descriptors |= strcmp(e.extensionName, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME) == 0;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 1;
+    dci.enabledExtensionCount = push_descriptors ? 2 : 1;
     dci.ppEnabledExtensionNames = dexts;
     VK_CHECK(vkCreateDevice(physical, &dci, nullptr, &device));
 #define LOAD(fn) fn = (PFN_##fn)vkGetDeviceProcAddr(device, #fn);
     VK_DEVICE_FNS(LOAD)
 #undef LOAD
+    if (push_descriptors)
+        vkCmdPushDescriptorSetKHR =
+            (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(device, "vkCmdPushDescriptorSetKHR");
     vkGetDeviceQueue(device, queue_family, 0, &queue);
     return true;
 }
@@ -307,6 +347,236 @@ bool create_pipelines() {
     return true;
 }
 
+int memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(physical, &mp);
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+        if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return int(i);
+    return -1;
+}
+
+// A pipeline for the draw-cost test's extra cases: the quad shaders (corners from a vertex buffer
+// when <vertex_input>), <fs>, opaque, depth/cull state dynamic when <dynamic_depth_cull>.
+bool make_pipeline(VkPipelineLayout pl, bool vertex_input, const uint32_t* fs_code, size_t fs_size,
+                   bool dynamic_depth_cull, VkPipeline* out) {
+    VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    VkShaderModule vs, fs;
+    mci.codeSize = vertex_input ? sizeof(quad_vb_vert) : sizeof(quad_vert);
+    mci.pCode = vertex_input ? quad_vb_vert : quad_vert;
+    VK_CHECK(vkCreateShaderModule(device, &mci, nullptr, &vs));
+    mci.codeSize = fs_size;
+    mci.pCode = fs_code;
+    VK_CHECK(vkCreateShaderModule(device, &mci, nullptr, &fs));
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main"};
+    stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main"};
+    VkVertexInputBindingDescription vb{0, 2 * sizeof(float), VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription va{0, 0, VK_FORMAT_R32G32_SFLOAT, 0};
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    if (vertex_input) {
+        vi.vertexBindingDescriptionCount = 1;
+        vi.pVertexBindingDescriptions = &vb;
+        vi.vertexAttributeDescriptionCount = 1;
+        vi.pVertexAttributeDescriptions = &va;
+    }
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo dss{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineColorBlendAttachmentState blend{};
+    blend.colorWriteMask = 0xf;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1;
+    cb.pAttachments = &blend;
+    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
+                            VK_DYNAMIC_STATE_CULL_MODE,         VK_DYNAMIC_STATE_FRONT_FACE,
+                            VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+                            VK_DYNAMIC_STATE_DEPTH_COMPARE_OP};
+    VkPipelineDynamicStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    ds.dynamicStateCount = dynamic_depth_cull ? 7 : 2;
+    ds.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo pci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    pci.stageCount = 2;
+    pci.pStages = stages;
+    pci.pVertexInputState = &vi;
+    pci.pInputAssemblyState = &ia;
+    pci.pViewportState = &vp;
+    pci.pRasterizationState = &rs;
+    pci.pMultisampleState = &ms;
+    pci.pDepthStencilState = &dss;
+    pci.pColorBlendState = &cb;
+    pci.pDynamicState = &ds;
+    pci.layout = pl;
+    pci.renderPass = render_pass;
+    VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pci, nullptr, out));
+    vkDestroyShaderModule(device, vs, nullptr);
+    vkDestroyShaderModule(device, fs, nullptr);
+    return true;
+}
+
+// The buffer, texture, descriptor layouts and pipelines of the draw-cost test's extra cases.
+bool create_draw_state() {
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(physical, &props);
+    ubo_align = std::max<VkDeviceSize>(props.limits.minUniformBufferOffsetAlignment, 16);
+    vb_offset = kUboSlots * ubo_align;
+    ib_offset = vb_offset + kVbCopies * 4 * 2 * sizeof(float);
+    const VkDeviceSize size = ib_offset + 2 * 16;
+
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = size;
+    bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    VK_CHECK(vkCreateBuffer(device, &bci, nullptr, &buffer));
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device, buffer, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    int type = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (type < 0) { check(false, "vulkan", "no host-visible memory for the test buffer"); return false; }
+    mai.memoryTypeIndex = uint32_t(type);
+    VkDeviceMemory buffer_memory;
+    VK_CHECK(vkAllocateMemory(device, &mai, nullptr, &buffer_memory));
+    VK_CHECK(vkBindBufferMemory(device, buffer, buffer_memory, 0));
+    char* data;
+    VK_CHECK(vkMapMemory(device, buffer_memory, 0, VK_WHOLE_SIZE, 0, (void**)&data));
+    for (uint32_t s = 0; s < kUboSlots; s++) {
+        float tint[4] = {1.0f, 1.0f - s / 512.0f, 1.0f, 1.0f};
+        memcpy(data + s * ubo_align, tint, sizeof tint);
+    }
+    static const float kCorners[8] = {0, 0, 1, 0, 0, 1, 1, 1};
+    for (uint32_t c = 0; c < kVbCopies; c++) memcpy(data + vb_offset + c * sizeof kCorners, kCorners, sizeof kCorners);
+    static const uint16_t kIndices[6] = {0, 1, 2, 1, 3, 2};
+    for (int c = 0; c < 2; c++) memcpy(data + ib_offset + c * 16, kIndices, sizeof kIndices);
+
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ici.extent = {4, 4, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    VkImage texture;
+    VK_CHECK(vkCreateImage(device, &ici, nullptr, &texture));
+    vkGetImageMemoryRequirements(device, texture, &req);
+    mai.allocationSize = req.size;
+    type = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (type < 0) type = memory_type(req.memoryTypeBits, 0);
+    mai.memoryTypeIndex = uint32_t(type);
+    VkDeviceMemory texture_memory;
+    VK_CHECK(vkAllocateMemory(device, &mai, nullptr, &texture_memory));
+    VK_CHECK(vkBindImageMemory(device, texture, texture_memory, 0));
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = texture;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = ici.format;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VK_CHECK(vkCreateImageView(device, &vci, nullptr, &texture_view));
+    VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+    VK_CHECK(vkCreateSampler(device, &sci, nullptr, &sampler));
+
+    // The texture's contents (white) and layout, once, on frame 0's command buffer.
+    VkCommandBuffer cmd = frames[0].cmd;
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = texture;
+    barrier.subresourceRange = vci.subresourceRange;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &barrier);
+    VkClearColorValue white{{1.0f, 1.0f, 1.0f, 1.0f}};
+    vkCmdClearColorImage(cmd, texture, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &white, 1, &vci.subresourceRange);
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &barrier);
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    VK_CHECK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
+    VK_CHECK(vkQueueWaitIdle(queue));
+
+    // Set layouts: binding 0 the uniform buffer (dynamic in the bound-set case), binding 1 the texture.
+    VkPushConstantRange range{VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(Push)};
+    auto make_layout = [&](VkDescriptorType ubo_type, VkDescriptorSetLayoutCreateFlags flags,
+                           VkDescriptorSetLayout* set_layout, VkPipelineLayout* pl) {
+        VkDescriptorSetLayoutBinding b[2]{};
+        b[0] = {0, ubo_type, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        b[1] = {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        dli.flags = flags;
+        dli.bindingCount = 2;
+        dli.pBindings = b;
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &dli, nullptr, set_layout));
+        VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        lci.setLayoutCount = 1;
+        lci.pSetLayouts = set_layout;
+        lci.pushConstantRangeCount = 1;
+        lci.pPushConstantRanges = &range;
+        VK_CHECK(vkCreatePipelineLayout(device, &lci, nullptr, pl));
+        return true;
+    };
+    VkDescriptorSetLayout sl_dyn, sl_push;
+    if (!make_layout(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 0, &sl_dyn, &layout_dyn) ||
+        !make_layout(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 0, &set_layout_plain, &layout_plain))
+        return false;
+    if (vkCmdPushDescriptorSetKHR &&
+        !make_layout(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+                     &sl_push, &layout_push))
+        return false;
+
+    // The bound set (written once) and each frame's pool for the per-draw sets.
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1},
+                                     {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1}};
+    VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpi.maxSets = 1;
+    dpi.poolSizeCount = 2;
+    dpi.pPoolSizes = sizes;
+    VkDescriptorPool pool_dyn;
+    VK_CHECK(vkCreateDescriptorPool(device, &dpi, nullptr, &pool_dyn));
+    VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dai.descriptorPool = pool_dyn;
+    dai.descriptorSetCount = 1;
+    dai.pSetLayouts = &sl_dyn;
+    VK_CHECK(vkAllocateDescriptorSets(device, &dai, &set_dyn));
+    VkDescriptorBufferInfo ubo{buffer, 0, 16};
+    VkDescriptorImageInfo tex{sampler, texture_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet w[2]{};
+    w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set_dyn, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+            nullptr, &ubo, nullptr};
+    w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set_dyn, 1, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            &tex, nullptr, nullptr};
+    vkUpdateDescriptorSets(device, 2, w, 0, nullptr);
+    sizes[0] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxDrawsPerFrame};
+    sizes[1] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kMaxDrawsPerFrame};
+    dpi.maxSets = kMaxDrawsPerFrame;
+    for (Frame& f : frames) VK_CHECK(vkCreateDescriptorPool(device, &dpi, nullptr, &f.set_pool));
+
+    return make_pipeline(layout, false, quad_frag, sizeof(quad_frag), true, &pipe_dynstate) &&
+           make_pipeline(layout, true, quad_frag, sizeof(quad_frag), false, &pipe_vb) &&
+           make_pipeline(layout_dyn, false, quad_ubo_frag, sizeof(quad_ubo_frag), false, &pipe_dyn) &&
+           make_pipeline(layout_plain, false, quad_ubo_frag, sizeof(quad_ubo_frag), false, &pipe_plain) &&
+           (!vkCmdPushDescriptorSetKHR ||
+            make_pipeline(layout_push, false, quad_ubo_frag, sizeof(quad_ubo_frag), false, &pipe_push));
+}
+
 struct FrameStats {
     uint64_t record_us;  // CPU: recording the draws
     uint64_t submit_us;  // CPU: vkQueueSubmit + vkQueuePresentKHR
@@ -315,12 +585,27 @@ struct FrameStats {
     uint64_t present_at_us;
 };
 
-// Pipeline switches in the draw-cost test: none, between two pipelines with the same shaders (blend
-// differs), between two with different fragment shaders.
-enum Switch { kNoSwitch, kSameShaders, kOtherShaders };
+// What the draw-cost test does before every draw, besides its push constants: nothing; a pipeline
+// switch between two with the same shaders (blend differs) or with different fragment shaders;
+// viewport + scissor; cull mode, front face and depth test/write/compare; a vertex and an index
+// buffer bind (indexed draw); the bound set again with another dynamic uniform offset; push
+// descriptors (uniform buffer + texture); a new set from the frame's pool written and bound. Values
+// alternate, so the driver can't skip them as unchanged.
+enum Mode {
+    kNoSwitch,
+    kSameShaders,
+    kOtherShaders,
+    kViewport,
+    kDepthCull,
+    kVertexIndex,
+    kBindSet,
+    kPushDescriptors,
+    kWriteSet,
+    kModes
+};
 
-// One frame of <draws> quads, binding a pipeline before every draw as <sw> says.
-bool frame(uint64_t index, int draws, Switch sw, float r, float g, float b, FrameStats* out) {
+// One frame of <draws> quads, with <mode>'s work before every draw.
+bool frame(uint64_t index, int draws, Mode mode, float r, float g, float b, FrameStats* out) {
     Frame& f = frames[index & 1];
     uint64_t t0 = now_us();
     vkWaitForFences(device, 1, &f.fence, VK_TRUE, UINT64_MAX);
@@ -333,6 +618,7 @@ bool frame(uint64_t index, int draws, Switch sw, float r, float g, float b, Fram
             out->gpu_ms = double(ts[1] - ts[0]) * timestamp_period_ns / 1e6;
     }
     vkResetFences(device, 1, &f.fence);
+    if (mode == kWriteSet) vkResetDescriptorPool(device, f.set_pool, 0);
     uint32_t image;
     VkResult acq = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, f.acquired, VK_NULL_HANDLE, &image);
     if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) {
@@ -362,11 +648,79 @@ bool frame(uint64_t index, int draws, Switch sw, float r, float g, float b, Fram
     VkRect2D scissor{{0, 0}, {kWidth, kHeight}};
     vkCmdSetViewport(f.cmd, 0, 1, &viewport);
     vkCmdSetScissor(f.cmd, 0, 1, &scissor);
-    vkCmdBindPipeline(f.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines[0]);
+    VkPipeline first = pipelines[0];
+    VkPipelineLayout pl = layout;
+    switch (mode) {
+    case kDepthCull: first = pipe_dynstate; break;
+    case kVertexIndex: first = pipe_vb; break;
+    case kBindSet: first = pipe_dyn, pl = layout_dyn; break;
+    case kPushDescriptors: first = pipe_push, pl = layout_push; break;
+    case kWriteSet: first = pipe_plain, pl = layout_plain; break;
+    default: break;
+    }
+    vkCmdBindPipeline(f.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, first);
     const int cols = 100;
     for (int i = 0; i < draws; i++) {
-        if (sw != kNoSwitch)
-            vkCmdBindPipeline(f.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines[(i & 1) * (sw == kSameShaders ? 1 : 2)]);
+        const bool odd = i & 1;
+        switch (mode) {
+        case kNoSwitch: break;
+        case kSameShaders:
+        case kOtherShaders:
+            vkCmdBindPipeline(f.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              pipelines[odd * (mode == kSameShaders ? 1 : 2)]);
+            break;
+        case kViewport: {
+            VkViewport v{odd ? 4.0f : 0.0f, 0, float(kWidth), float(kHeight), 0, 1};
+            VkRect2D s{{0, 0}, {kWidth - (odd ? 4u : 0u), kHeight}};
+            vkCmdSetViewport(f.cmd, 0, 1, &v);
+            vkCmdSetScissor(f.cmd, 0, 1, &s);
+            break;
+        }
+        case kDepthCull:
+            vkCmdSetCullMode(f.cmd, odd ? VK_CULL_MODE_FRONT_BIT : VK_CULL_MODE_NONE);
+            vkCmdSetFrontFace(f.cmd, odd ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+            vkCmdSetDepthTestEnable(f.cmd, odd);
+            vkCmdSetDepthWriteEnable(f.cmd, odd);
+            vkCmdSetDepthCompareOp(f.cmd, odd ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_ALWAYS);
+            break;
+        case kVertexIndex: {
+            VkDeviceSize vb = vb_offset + (i % kVbCopies) * 4 * 2 * sizeof(float);
+            vkCmdBindVertexBuffers(f.cmd, 0, 1, &buffer, &vb);
+            vkCmdBindIndexBuffer(f.cmd, buffer, ib_offset + (odd ? 16 : 0), VK_INDEX_TYPE_UINT16);
+            break;
+        }
+        case kBindSet: {
+            uint32_t offset = uint32_t((i % kUboSlots) * ubo_align);
+            vkCmdBindDescriptorSets(f.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_dyn, 0, 1, &set_dyn, 1, &offset);
+            break;
+        }
+        case kPushDescriptors:
+        case kWriteSet: {
+            VkDescriptorBufferInfo ubo{buffer, (i % kUboSlots) * ubo_align, 16};
+            VkDescriptorImageInfo tex{sampler, texture_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkDescriptorSet set = VK_NULL_HANDLE;
+            if (mode == kWriteSet) {
+                VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+                dai.descriptorPool = f.set_pool;
+                dai.descriptorSetCount = 1;
+                dai.pSetLayouts = &set_layout_plain;
+                if (vkAllocateDescriptorSets(device, &dai, &set) != VK_SUCCESS) break;
+            }
+            VkWriteDescriptorSet w[2]{};
+            w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                    nullptr, &ubo, nullptr};
+            w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 1, 0, 1,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &tex, nullptr, nullptr};
+            if (mode == kPushDescriptors) {
+                vkCmdPushDescriptorSetKHR(f.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_push, 0, 2, w);
+            } else {
+                vkUpdateDescriptorSets(device, 2, w, 0, nullptr);
+                vkCmdBindDescriptorSets(f.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_plain, 0, 1, &set, 0, nullptr);
+            }
+            break;
+        }
+        case kModes: break;
+        }
         Push p{};
         p.offset[0] = float(i % cols) / cols;
         p.offset[1] = float((i / cols) % cols) / cols;
@@ -375,8 +729,11 @@ bool frame(uint64_t index, int draws, Switch sw, float r, float g, float b, Fram
         p.color[1] = float((index * 3) & 255) / 255.0f;
         p.color[2] = 0.5f;
         p.color[3] = 0.7f;
-        vkCmdPushConstants(f.cmd, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof p, &p);
-        vkCmdDraw(f.cmd, 6, 1, 0, 0);
+        vkCmdPushConstants(f.cmd, pl, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof p, &p);
+        if (mode == kVertexIndex)
+            vkCmdDrawIndexed(f.cmd, 6, 1, 0, 0, 0);
+        else
+            vkCmdDraw(f.cmd, 6, 1, 0, 0);
     }
     vkCmdEndRenderPass(f.cmd);
     if (timestamps_ok)
@@ -413,11 +770,12 @@ bool frame(uint64_t index, int draws, Switch sw, float r, float g, float b, Fram
     return true;
 }
 
-// <frames> frames of <draws> draws: the driver's CPU cost per draw.
-bool draw_cost(int draws, Switch sw, int nframes, uint64_t* index) {
+// <frames> frames of <draws> draws: the driver's CPU cost per draw. <plain_us>: the plain draw's cost
+// at this count, for the extra cost of <mode>'s work (0: not known yet; set from a kNoSwitch run).
+bool draw_cost(int draws, Mode mode, int nframes, uint64_t* index, double* plain_us = nullptr) {
     std::vector<FrameStats> stats(nframes);
     for (int i = 0; i < nframes; i++)
-        if (!frame((*index)++, draws, sw, 0.05f, 0.05f, 0.1f, &stats[i])) return false;
+        if (!frame((*index)++, draws, mode, 0.05f, 0.05f, 0.1f, &stats[i])) return false;
     // Skip the first frames (first-use allocations), take medians.
     auto median = [&](auto field) {
         std::vector<double> v;
@@ -428,10 +786,18 @@ bool draw_cost(int draws, Switch sw, int nframes, uint64_t* index) {
     double rec = median([](const FrameStats& s) { return double(s.record_us); });
     double sub = median([](const FrameStats& s) { return double(s.submit_us); });
     double gpu = median([](const FrameStats& s) { return s.gpu_ms; });
-    static const char* const kLabels[] = {"                         ", " + switch, same shaders  ",
-                                          " + switch, other shaders "};
-    report("draw-cost: %5d draws%s: record %.2f us/draw (%.2f ms), submit+present %.2f ms, GPU %.2f ms", draws,
-           kLabels[sw], rec / draws, rec / 1000.0, sub / 1000.0, gpu);
+    static const char* const kLabels[kModes] = {
+        "                          ", " + switch, same shaders   ", " + switch, other shaders  ",
+        " + viewport, scissor      ", " + cull, depth state      ", " + vertex/index bind      ",
+        " + set, dynamic offset    ", " + push descriptors       ", " + set written + bound    "};
+    const double per_draw = rec / draws;
+    char extra[48] = "";
+    if (plain_us && mode == kNoSwitch)
+        *plain_us = per_draw;
+    else if (plain_us && *plain_us > 0)
+        snprintf(extra, sizeof extra, " (+%.2f us)", per_draw - *plain_us);
+    report("draw-cost: %5d draws%s: record %.2f us/draw%s (%.2f ms), submit+present %.2f ms, GPU %.2f ms", draws,
+           kLabels[mode], per_draw, extra, rec / 1000.0, sub / 1000.0, gpu);
     return true;
 }
 
@@ -467,13 +833,23 @@ bool run_gpu_tests() {
     uint64_t t0 = now_us();
     if (!create_device() || !create_swapchain() || !create_pipelines()) return false;
     report("vulkan up in %.1f ms", (now_us() - t0) / 1000.0);
+    if (!create_draw_state()) return false;
     uint64_t index = 0;
     bool ok = pacing(300, &index);
+    double plain_5000 = 0;
     for (int draws : {1000, 5000, 10000})
-        ok = ok && draw_cost(draws, kNoSwitch, 40, &index);
-    for (Switch sw : {kSameShaders, kOtherShaders})
+        ok = ok && draw_cost(draws, kNoSwitch, 40, &index, draws == 5000 ? &plain_5000 : nullptr);
+    for (Mode mode : {kSameShaders, kOtherShaders})
         for (int draws : {1000, 5000})
-            ok = ok && draw_cost(draws, sw, 40, &index);
+            ok = ok && draw_cost(draws, mode, 40, &index, draws == 5000 ? &plain_5000 : nullptr);
+    // What translation layers do around a draw, 5000 draws each; "+" is the cost over a plain draw.
+    for (Mode mode : {kViewport, kDepthCull, kVertexIndex, kBindSet, kPushDescriptors, kWriteSet}) {
+        if (mode == kPushDescriptors && !vkCmdPushDescriptorSetKHR) {
+            report("draw-cost: push descriptors skipped (no VK_KHR_push_descriptor)");
+            continue;
+        }
+        ok = ok && draw_cost(5000, mode, 40, &index, &plain_5000);
+    }
     // The verdict on screen until the app exits: green, or red when a check failed.
     bool passed = failures() == 0;
     FrameStats s;

@@ -10,7 +10,7 @@ set(KIT_TEST_VERSION "00.00" CACHE STRING "Version shown in the results")
 # SPIR-V for the test's shaders, as C arrays.
 find_program(GLSLANG glslangValidator HINTS $ENV{HOME}/ps4kit-build/host-tools/bin REQUIRED)
 set(_shader_headers)
-foreach (shader quad.vert quad.frag quad2.frag)
+foreach (shader quad.vert quad.frag quad2.frag quad_vb.vert quad_ubo.frag)
     set(_out ${CMAKE_CURRENT_BINARY_DIR}/${shader}.h)
     string(REPLACE "." "_" _var ${shader})
     add_custom_command(
