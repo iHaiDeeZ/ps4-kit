@@ -4,7 +4,8 @@ The shared PS4 base of our ports: one runtime, one Mesa/RADV, one presenter, one
 set of packaging scripts, instead of a diverging copy in every port. It is the merge of the twelve
 ports' copies (CEMUPS4, Conker, March33, Resonance, SMW, SSBU, Sonic, Vita3K/HENkaku, rcps3,
 xemu-ps4, G-Diffuser, PS2/DawnStation), taking each copy's fixes. `docs/merge-notes/` records where
-each piece came from and what each port would set when it moves over. No port builds with the kit yet.
+each piece came from and what each port would set when it moves over. Newer ports (Conker: Live & Reloaded,
+Tekken Tag 2, Etterna, Godot, Space Cadet Pinball) build with it; the older ones still carry their own copies.
 
 ## Layout
 
@@ -13,7 +14,7 @@ each piece came from and what each port would set when it moves over. No port bu
 | `ps4-kit.cmake` | include from a project: `ps4_kit_app(target)`, `ps4_kit_link_mesa(target)` |
 | `toolchain/` | clang 21 + libc++ 21 toolchain file, `env.sh`, libc header overlay, sysroot/libc++ build scripts |
 | `runtime/` | heap (dlmalloc, blocking locks, per-thread arenas, overflow heaps), libc fixes, stdio lock, file layer (`*at`, cwd, path tidying), DNS, SMB/NFS under `/net`, crash log, sampler, profiler. API: `ps4_kit.h`, `ps4_kit_diag.h`, `ps4_kit_io.h` |
-| `gpu/` | `build-mesa.sh` + `mesa-patches/` (27 PS4 patches on Mesa 26.0.8), `ps4_vk_wsi.*` (Vulkan swapchain on VideoOut) |
+| `gpu/` | `build-mesa.sh` + `mesa-patches/` (32 PS4 patches on Mesa 26.0.8), `ps4_vk_wsi.*` (Vulkan swapchain on VideoOut) |
 | `scripts/` | `make-pkg.sh`, `upload.sh`, `seed-build-tree.sh`, crash log and profile tools |
 | `samples/kit-test/` | the kit on the console, measured; also the template for a new port |
 
@@ -60,3 +61,8 @@ every diagnostic has an off switch, the profilers start off.
 - A `--wrap` of a function nothing else in the program calls leaves `__real_<name>` as an import, and
   create-fself refuses it (TTT2: vprintf, putc, putchar, perror). Wraps of libc functions the app may
   not use are also linked with `--undefined=<name>`, which pulls the libc member in.
+
+## License
+
+MIT (`LICENSE`). The Mesa patches are under Mesa's own MIT license, and `runtime/third_party/dlmalloc`
+keeps Doug Lea's notice.
